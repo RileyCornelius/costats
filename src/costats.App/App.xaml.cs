@@ -28,6 +28,7 @@ namespace costats.App
         private IHost? _host;
         private SingleInstanceCoordinator? _singleInstance;
         private StartupUpdateCoordinator? _updateCoordinator;
+        private ThemeService? _themeService;
 
         protected override void OnStartup(System.Windows.StartupEventArgs e)
         {
@@ -83,6 +84,7 @@ namespace costats.App
                 Log.Warning(ex, "Error during host shutdown");
             }
 
+            _themeService?.Dispose();
             _singleInstance?.Dispose();
             Log.CloseAndFlush();
             base.OnExit(e);
@@ -106,7 +108,10 @@ namespace costats.App
 
                 await Dispatcher.InvokeAsync(() =>
                 {
-                    var tray = InitializeHost(settingsStore, settings);
+                    _themeService = new ThemeService(this);
+                    _themeService.ApplyTheme(settings.AppThemeMode);
+
+                    var tray = InitializeHost(settingsStore, settings, _themeService);
                     LogFireAndForget(StartListenerAsync(tray), "SingleInstanceListener");
                     tray.ShowWidget();
                 });
@@ -206,7 +211,7 @@ namespace costats.App
                 TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
         }
 
-        private TrayHost InitializeHost(ISettingsStore settingsStore, AppSettings settings)
+        private TrayHost InitializeHost(ISettingsStore settingsStore, AppSettings settings, ThemeService themeService)
         {
             _host = Host.CreateDefaultBuilder()
                 .ConfigureAppConfiguration(config =>
@@ -224,6 +229,7 @@ namespace costats.App
                 {
                     services.AddSingleton<ISettingsStore>(settingsStore);
                     services.AddSingleton(settings);
+                    services.AddSingleton(themeService);
 
                     if (_updateCoordinator is not null)
                     {
