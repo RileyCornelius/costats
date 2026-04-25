@@ -21,6 +21,7 @@ public sealed class PricingCatalogTests
 
         Assert.NotNull(pricing);
         Assert.Equal(0.123m, pricing.InputCostPerToken);
+        Assert.Equal(PricingSource.FreshCache, catalog.Status.ActiveSource);
     }
 
     [Fact]
@@ -36,6 +37,8 @@ public sealed class PricingCatalogTests
 
         Assert.NotNull(pricing);
         Assert.Equal(0.456m, pricing.InputCostPerToken);
+        Assert.Equal(PricingSource.LiteLlm, catalog.Status.ActiveSource);
+        Assert.NotNull(catalog.Status.LastSuccessfulRefreshAt);
     }
 
     [Fact]
@@ -58,6 +61,7 @@ public sealed class PricingCatalogTests
 
         Assert.NotNull(pricing);
         Assert.Equal(0.00000125m, pricing.InputCostPerToken);
+        Assert.Equal(PricingSource.OpenRouter, catalog.Status.ActiveSource);
     }
 
     [Fact]
@@ -76,6 +80,7 @@ public sealed class PricingCatalogTests
 
         Assert.NotNull(pricing);
         Assert.Equal(0.789m, pricing.InputCostPerToken);
+        Assert.Equal(PricingSource.StaleCache, catalog.Status.ActiveSource);
     }
 
     [Fact]
@@ -91,6 +96,20 @@ public sealed class PricingCatalogTests
 
         Assert.NotNull(pricing);
         Assert.Equal(0.000005m, pricing.InputCostPerToken);
+        Assert.Equal(PricingSource.EmbeddedSnapshot, catalog.Status.ActiveSource);
+    }
+
+    [Fact]
+    public async Task Lookup_tracks_unknown_models_in_status()
+    {
+        using var temp = new TempDirectory();
+        var catalog = CreateCatalog(temp.Path, liteLlm: Response(CatalogJson("gpt-5", 0.123m)));
+
+        var pricing = await catalog.LookupAsync("unknown-model", "openai");
+
+        Assert.Null(pricing);
+        Assert.Equal(1, catalog.Status.UnmatchedModelCount);
+        Assert.Contains("openai/unknown-model", catalog.Status.UnmatchedModels);
     }
 
     [Fact]

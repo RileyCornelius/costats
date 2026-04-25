@@ -7,6 +7,8 @@ public sealed class EmbeddedPricingSnapshot
 {
     private const string ResourceName = "costats.Infrastructure.Pricing.Resources.litellm-snapshot.json";
 
+    public string SnapshotLabel => "litellm-snapshot embedded in assembly";
+
     public async Task<IReadOnlyDictionary<string, ModelPricing>> LoadAsync(CancellationToken cancellationToken)
     {
         var assembly = Assembly.GetExecutingAssembly();

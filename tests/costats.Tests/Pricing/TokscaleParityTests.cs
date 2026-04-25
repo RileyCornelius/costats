@@ -37,6 +37,7 @@ public sealed class TokscaleParityTests
 
             Assert.Equal(tokscalePricing.InputCostPerToken, actualPricing.InputCostPerToken);
             Assert.Equal(tokscalePricing.OutputCostPerToken, actualPricing.OutputCostPerToken);
+            Assert.Equal(tokscalePricing.ReasoningOutputCostPerToken, actualPricing.ReasoningOutputCostPerToken);
             Assert.Equal(tokscalePricing.CacheReadInputTokenCost, actualPricing.CacheReadInputTokenCost);
             Assert.Equal(tokscalePricing.CacheCreationInputTokenCost, actualPricing.CacheCreationInputTokenCost);
 
@@ -69,6 +70,7 @@ public sealed class TokscaleParityTests
     {
         return Tiered(ledger.StandardInput, pricing.InputCostPerToken, pricing.InputCostPerTokenAbove200k)
             + Tiered(ledger.GeneratedOutput, pricing.OutputCostPerToken, pricing.OutputCostPerTokenAbove200k)
+            + Tiered(ledger.ReasoningOutput, pricing.ReasoningOutputCostPerToken ?? pricing.OutputCostPerToken, pricing.ReasoningOutputCostPerTokenAbove200k ?? pricing.OutputCostPerTokenAbove200k)
             + Tiered(ledger.CachedInput, pricing.CacheReadInputTokenCost, pricing.CacheReadInputTokenCostAbove200k)
             + Tiered(ledger.CacheWriteInput, pricing.CacheCreationInputTokenCost, pricing.CacheCreationInputTokenCostAbove200k);
 
@@ -169,14 +171,16 @@ public sealed class TokscaleParityTests
         int StandardInput,
         int CachedInput,
         int CacheWriteInput,
-        int GeneratedOutput)
+        int GeneratedOutput,
+        int ReasoningOutput = 0)
     {
         public TokenLedger ToLedger() => new()
         {
             StandardInput = StandardInput,
             CachedInput = CachedInput,
             CacheWriteInput = CacheWriteInput,
-            GeneratedOutput = GeneratedOutput
+            GeneratedOutput = GeneratedOutput,
+            ReasoningOutput = ReasoningOutput
         };
     }
 
@@ -188,6 +192,12 @@ public sealed class TokscaleParityTests
         [JsonPropertyName("outputCostPerToken")]
         public decimal? OutputCostPerToken { get; init; }
 
+        [JsonPropertyName("reasoningOutputCostPerToken")]
+        public decimal? ReasoningOutputCostPerToken { get; init; }
+
+        [JsonPropertyName("reasoningOutputCostPerTokenAbove200k")]
+        public decimal? ReasoningOutputCostPerTokenAbove200k { get; init; }
+
         [JsonPropertyName("cacheReadInputTokenCost")]
         public decimal? CacheReadInputTokenCost { get; init; }
 
@@ -198,6 +208,8 @@ public sealed class TokscaleParityTests
         {
             InputCostPerToken = InputCostPerToken,
             OutputCostPerToken = OutputCostPerToken,
+            ReasoningOutputCostPerToken = ReasoningOutputCostPerToken,
+            ReasoningOutputCostPerTokenAbove200k = ReasoningOutputCostPerTokenAbove200k,
             CacheReadInputTokenCost = CacheReadInputTokenCost,
             CacheCreationInputTokenCost = CacheCreationInputTokenCost
         };

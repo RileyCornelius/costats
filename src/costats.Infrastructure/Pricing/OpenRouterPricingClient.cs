@@ -52,6 +52,7 @@ public sealed class OpenRouterPricingClient
             {
                 InputCostPerToken = GetDecimalOrNull(pricing, "prompt"),
                 OutputCostPerToken = GetDecimalOrNull(pricing, "completion"),
+                ReasoningOutputCostPerToken = GetDecimalOrNull(pricing, "internal_reasoning"),
                 CacheReadInputTokenCost = GetDecimalOrNull(pricing, "input_cache_read"),
                 CacheCreationInputTokenCost = GetDecimalOrNull(pricing, "input_cache_write"),
                 LiteLlmProvider = ProviderFromModelId(id)

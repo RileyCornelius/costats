@@ -15,8 +15,11 @@ public sealed class PricingCatalog : IPricingCatalog
     private readonly ILogger<PricingCatalog> _logger;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
     private readonly ConcurrentDictionary<string, ModelPricing?> _lookupCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _unmatchedModels = new(StringComparer.OrdinalIgnoreCase);
 
     private IReadOnlyDictionary<string, ModelPricing>? _pricing;
+    private PricingSource _activeSource = PricingSource.Unknown;
+    private DateTimeOffset? _lastSuccessfulRefreshAt;
 
     public PricingCatalog(
         PricingDiskCache diskCache,
@@ -34,6 +37,12 @@ public sealed class PricingCatalog : IPricingCatalog
         _logger = logger;
     }
 
+    public PricingStatus Status => new(
+        _activeSource,
+        _lastSuccessfulRefreshAt,
+        _unmatchedModels.Count,
+        _unmatchedModels.Keys.Order(StringComparer.OrdinalIgnoreCase).ToArray());
+
     public async ValueTask<ModelPricing?> LookupAsync(
         string modelId,
         string? providerHint = null,
@@ -47,6 +56,7 @@ public sealed class PricingCatalog : IPricingCatalog
             var match = _matcher.Match(modelId, pricing, providerHint);
             if (match is null)
             {
+                _unmatchedModels.TryAdd(string.IsNullOrWhiteSpace(providerHint) ? modelId : $"{providerHint}/{modelId}", 0);
                 _logger.LogWarning("No pricing match found for model {ModelId} with provider hint {ProviderHint}", modelId, providerHint);
             }
 
@@ -96,6 +106,7 @@ public sealed class PricingCatalog : IPricingCatalog
             var fresh = await _diskCache.ReadFreshAsync(cancellationToken).ConfigureAwait(false);
             if (fresh is { Count: > 0 })
             {
+                ActivateSource(PricingSource.FreshCache, fresh.Count, lastSuccessfulRefreshAt: _diskCache.LiteLlmCacheLastWriteTime);
                 return fresh;
             }
         }
@@ -106,6 +117,7 @@ public sealed class PricingCatalog : IPricingCatalog
             if (live.Count > 0)
             {
                 await _diskCache.WriteAsync(live, cancellationToken).ConfigureAwait(false);
+                ActivateSource(PricingSource.LiteLlm, live.Count, refreshed: true);
                 return live;
             }
         }
@@ -119,6 +131,7 @@ public sealed class PricingCatalog : IPricingCatalog
             var openRouter = await _openRouterClient.FetchAsync(cancellationToken).ConfigureAwait(false);
             if (openRouter.Count > 0)
             {
+                ActivateSource(PricingSource.OpenRouter, openRouter.Count, refreshed: true);
                 return openRouter;
             }
         }
@@ -130,11 +143,38 @@ public sealed class PricingCatalog : IPricingCatalog
         var stale = await _diskCache.ReadAnyAgeAsync(cancellationToken).ConfigureAwait(false);
         if (stale is { Count: > 0 })
         {
-            _logger.LogInformation("Using stale pricing cache");
+            ActivateSource(PricingSource.StaleCache, stale.Count, lastSuccessfulRefreshAt: _diskCache.LiteLlmCacheLastWriteTime);
             return stale;
         }
 
-        _logger.LogInformation("Using embedded pricing snapshot");
-        return await _embeddedSnapshot.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var embedded = await _embeddedSnapshot.LoadAsync(cancellationToken).ConfigureAwait(false);
+        ActivateSource(PricingSource.EmbeddedSnapshot, embedded.Count, snapshotLabel: _embeddedSnapshot.SnapshotLabel);
+        return embedded;
+    }
+
+    private void ActivateSource(
+        PricingSource source,
+        int modelCount,
+        bool refreshed = false,
+        DateTimeOffset? lastSuccessfulRefreshAt = null,
+        string? snapshotLabel = null)
+    {
+        _activeSource = source;
+        if (refreshed)
+        {
+            _lastSuccessfulRefreshAt = DateTimeOffset.UtcNow;
+        }
+        else if (lastSuccessfulRefreshAt is not null)
+        {
+            _lastSuccessfulRefreshAt = lastSuccessfulRefreshAt;
+        }
+
+        _logger.LogInformation(
+            "Active pricing source: {PricingSource}; models={ModelCount}; lastSuccessfulRefresh={LastSuccessfulRefresh}; unmatchedModels={UnmatchedModelCount}; snapshot={SnapshotLabel}",
+            source,
+            modelCount,
+            _lastSuccessfulRefreshAt,
+            _unmatchedModels.Count,
+            snapshotLabel);
     }
 }

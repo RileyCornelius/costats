@@ -66,11 +66,14 @@ public sealed partial class ModelMatcher
         var attempts = new List<string>();
 
         AddAttempt(attempts, normalized);
-        foreach (var prefix in ProviderPrefixes)
+        for (var i = 0; i < attempts.Count; i++)
         {
-            if (normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            foreach (var prefix in ProviderPrefixes)
             {
-                AddAttempt(attempts, normalized[prefix.Length..]);
+                if (attempts[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    AddAttempt(attempts, attempts[i][prefix.Length..]);
+                }
             }
         }
 
@@ -80,6 +83,7 @@ public sealed partial class ModelMatcher
             AddAttempt(attempts, NormalizeVersionSeparator(attempt));
             AddAttempt(attempts, StripDateSuffix(attempt));
             AddAttempt(attempts, StripCodexSuffix(attempt));
+            AddAttempt(attempts, StripCloudAliasSuffix(attempt));
         }
 
         snapshot = attempts.ToArray();
@@ -87,6 +91,7 @@ public sealed partial class ModelMatcher
         {
             AddAttempt(attempts, StripDateSuffix(NormalizeVersionSeparator(attempt)));
             AddAttempt(attempts, StripCodexSuffix(NormalizeVersionSeparator(attempt)));
+            AddAttempt(attempts, StripCloudAliasSuffix(StripDateSuffix(NormalizeVersionSeparator(attempt))));
         }
 
         return attempts;
@@ -100,11 +105,26 @@ public sealed partial class ModelMatcher
         var stems = attempts.Select(FamilyStem).Where(stem => stem.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
         return candidates
-            .Where(pair => attempts.Any(attempt => attempt.StartsWith(pair.Key, StringComparison.OrdinalIgnoreCase)))
+            .Where(pair => attempts.Any(attempt => IsSafePrefixMatch(attempt, pair.Key)))
             .Where(pair => stems.Any(stem => pair.Key.StartsWith(stem, StringComparison.OrdinalIgnoreCase)))
             .OrderByDescending(pair => pair.Key.Length)
             .Select(pair => new ModelMatch(pair.Key, pair.Value))
             .FirstOrDefault();
+    }
+
+    private static bool IsSafePrefixMatch(string value, string prefix)
+    {
+        if (!value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (value.Length == prefix.Length)
+        {
+            return true;
+        }
+
+        return value[prefix.Length] is '-' or '.' or '_' or ':' or '@';
     }
 
     private static string FamilyStem(string value)
@@ -148,11 +168,23 @@ public sealed partial class ModelMatcher
         ? value[..^"-codex".Length]
         : value;
 
+    private static string StripCloudAliasSuffix(string value)
+    {
+        var withoutDeployment = CloudDeploymentSuffixRegex().Replace(value, string.Empty);
+        return VertexDateSuffixRegex().Replace(withoutDeployment, string.Empty);
+    }
+
     [GeneratedRegex(@"-(\d+)-(\d+)(?=-|$)", RegexOptions.CultureInvariant)]
     private static partial Regex SemanticVersionSuffixRegex();
 
     [GeneratedRegex(@"-\d{8}$", RegexOptions.CultureInvariant)]
     private static partial Regex DateSuffixRegex();
+
+    [GeneratedRegex(@"-\d{8}(-v\d+:\d+)?$", RegexOptions.CultureInvariant)]
+    private static partial Regex CloudDeploymentSuffixRegex();
+
+    [GeneratedRegex(@"@\d{8}$", RegexOptions.CultureInvariant)]
+    private static partial Regex VertexDateSuffixRegex();
 }
 
 public sealed record ModelMatch(string ModelId, ModelPricing Pricing);

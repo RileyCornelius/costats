@@ -52,6 +52,18 @@ public sealed class ExpenseAnalyzer
         return BuildDigest(slices, today, DefaultWindowDays);
     }
 
+    /// <summary>
+    /// Produces a consumption digest for local GitHub Copilot OTEL traces when present.
+    /// </summary>
+    public async Task<ConsumptionDigest> AnalyzeCopilotAsync(CancellationToken cancellationToken = default)
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var windowStart = today.AddDays(-(DefaultWindowDays - 1));
+
+        var slices = await CopilotOtelDigestor.DigestAsync(_pricingCatalog, windowStart, today, cancellationToken).ConfigureAwait(false);
+        return BuildDigest(slices, today, DefaultWindowDays);
+    }
+
     private static ConsumptionDigest BuildDigest(
         IReadOnlyList<ConsumptionSlice> slices,
         DateOnly today,
