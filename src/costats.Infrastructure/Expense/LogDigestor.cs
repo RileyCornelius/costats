@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using costats.Application.Pricing;
 using costats.Core.Pulse;
 
 namespace costats.Infrastructure.Expense;
@@ -17,28 +18,31 @@ public static class LogDigestor
     /// Digests Claude Code log files and produces consumption slices.
     /// </summary>
     public static Task<IReadOnlyList<ConsumptionSlice>> DigestClaudeLogsAsync(
+        IPricingCatalog pricingCatalog,
         DateOnly since,
         DateOnly until,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.Run(() => DigestClaudeLogsCore(since, until, cancellationToken), cancellationToken);
+        return Task.Run(() => DigestClaudeLogsCoreAsync(pricingCatalog, since, until, cancellationToken), cancellationToken);
     }
 
     /// <summary>
     /// Digests Claude Code log files from a specific directory and produces consumption slices.
     /// </summary>
     public static Task<IReadOnlyList<ConsumptionSlice>> DigestClaudeLogsAsync(
+        IPricingCatalog pricingCatalog,
         string logDirectory,
         DateOnly since,
         DateOnly until,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.Run(() => DigestClaudeLogsCore(logDirectory, since, until, cancellationToken), cancellationToken);
+        return Task.Run(() => DigestClaudeLogsCoreAsync(pricingCatalog, logDirectory, since, until, cancellationToken), cancellationToken);
     }
 
-    private static IReadOnlyList<ConsumptionSlice> DigestClaudeLogsCore(
+    private static async Task<IReadOnlyList<ConsumptionSlice>> DigestClaudeLogsCoreAsync(
+        IPricingCatalog pricingCatalog,
         DateOnly since,
         DateOnly until,
         CancellationToken cancellationToken)
@@ -55,13 +59,22 @@ public static class LogDigestor
         foreach (var projectDir in Directory.EnumerateDirectories(logDir))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            ScanClaudeDirectoryRecursive(projectDir, since, until, cutoff, aggregates, dedupeSet, cancellationToken);
+            await ScanClaudeDirectoryRecursiveAsync(
+                pricingCatalog,
+                projectDir,
+                since,
+                until,
+                cutoff,
+                aggregates,
+                dedupeSet,
+                cancellationToken).ConfigureAwait(false);
         }
 
         return BuildAggregatedSlices(aggregates);
     }
 
-    private static IReadOnlyList<ConsumptionSlice> DigestClaudeLogsCore(
+    private static async Task<IReadOnlyList<ConsumptionSlice>> DigestClaudeLogsCoreAsync(
+        IPricingCatalog pricingCatalog,
         string logDirectory,
         DateOnly since,
         DateOnly until,
@@ -77,13 +90,22 @@ public static class LogDigestor
         foreach (var projectDir in Directory.EnumerateDirectories(logDirectory))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            ScanClaudeDirectoryRecursive(projectDir, since, until, cutoff, aggregates, dedupeSet, cancellationToken);
+            await ScanClaudeDirectoryRecursiveAsync(
+                pricingCatalog,
+                projectDir,
+                since,
+                until,
+                cutoff,
+                aggregates,
+                dedupeSet,
+                cancellationToken).ConfigureAwait(false);
         }
 
         return BuildAggregatedSlices(aggregates);
     }
 
-    private static void ScanClaudeDirectoryRecursive(
+    private static async Task ScanClaudeDirectoryRecursiveAsync(
+        IPricingCatalog pricingCatalog,
         string directory,
         DateOnly since,
         DateOnly until,
@@ -99,14 +121,29 @@ public static class LogDigestor
             if (File.GetLastWriteTimeUtc(file) < cutoff)
                 continue;
 
-            DigestClaudeFile(file, since, until, aggregates, dedupeSet, cancellationToken);
+            await DigestClaudeFileAsync(
+                pricingCatalog,
+                file,
+                since,
+                until,
+                aggregates,
+                dedupeSet,
+                cancellationToken).ConfigureAwait(false);
         }
 
         // Recurse into subdirectories (e.g., subagents/)
         foreach (var subDir in Directory.EnumerateDirectories(directory))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            ScanClaudeDirectoryRecursive(subDir, since, until, cutoff, aggregates, dedupeSet, cancellationToken);
+            await ScanClaudeDirectoryRecursiveAsync(
+                pricingCatalog,
+                subDir,
+                since,
+                until,
+                cutoff,
+                aggregates,
+                dedupeSet,
+                cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -114,15 +151,17 @@ public static class LogDigestor
     /// Digests Codex log files and produces consumption slices.
     /// </summary>
     public static Task<IReadOnlyList<ConsumptionSlice>> DigestCodexLogsAsync(
+        IPricingCatalog pricingCatalog,
         DateOnly since,
         DateOnly until,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.Run(() => DigestCodexLogsCore(since, until, cancellationToken), cancellationToken);
+        return Task.Run(() => DigestCodexLogsCoreAsync(pricingCatalog, since, until, cancellationToken), cancellationToken);
     }
 
-    private static IReadOnlyList<ConsumptionSlice> DigestCodexLogsCore(
+    private static async Task<IReadOnlyList<ConsumptionSlice>> DigestCodexLogsCoreAsync(
+        IPricingCatalog pricingCatalog,
         DateOnly since,
         DateOnly until,
         CancellationToken cancellationToken)
@@ -137,13 +176,14 @@ public static class LogDigestor
         {
             cancellationToken.ThrowIfCancellationRequested();
             // Each file has its own cumulative totals - don't share across files
-            DigestCodexFile(file, since, until, aggregates, cancellationToken);
+            await DigestCodexFileAsync(pricingCatalog, file, since, until, aggregates, cancellationToken).ConfigureAwait(false);
         }
 
         return BuildAggregatedSlices(aggregates);
     }
 
-    private static void DigestClaudeFile(
+    private static async Task DigestClaudeFileAsync(
+        IPricingCatalog pricingCatalog,
         string filePath,
         DateOnly since,
         DateOnly until,
@@ -199,8 +239,8 @@ public static class LogDigestor
                     if (ledger.TotalConsumed == 0)
                         continue;
 
-                    var rate = TariffRegistry.FindClaudeRate(model);
-                    var cost = rate.ComputeCost(ledger);
+                    var pricing = await pricingCatalog.LookupAsync(model, "anthropic", cancellationToken).ConfigureAwait(false);
+                    var cost = pricing is null ? 0m : PricingCostCalculator.ComputeCost(pricing, ledger);
 
                     AddAggregate(aggregates, entryDate.Value, model, ledger, cost);
                 }
@@ -217,7 +257,8 @@ public static class LogDigestor
 
     }
 
-    private static void DigestCodexFile(
+    private static async Task DigestCodexFileAsync(
+        IPricingCatalog pricingCatalog,
         string filePath,
         DateOnly since,
         DateOnly until,
@@ -339,8 +380,8 @@ public static class LogDigestor
                         GeneratedOutput = Math.Max(0, deltaOutput)
                     };
 
-                    var rate = TariffRegistry.FindCodexRate(model);
-                    var cost = rate.ComputeCost(ledger);
+                    var pricing = await pricingCatalog.LookupAsync(model, "openai", cancellationToken).ConfigureAwait(false);
+                    var cost = pricing is null ? 0m : PricingCostCalculator.ComputeCost(pricing, ledger);
 
                     AddAggregate(aggregates, entryDate.Value, model, ledger, cost);
                 }
