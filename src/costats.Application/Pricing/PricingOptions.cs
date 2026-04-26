@@ -4,7 +4,7 @@ public sealed class PricingOptions
 {
     public const string SectionName = "Costats:Pricing";
 
-    public double RefreshHours { get; set; } = 1;
+    public double RefreshHours { get; set; } = 24;
 
     public string LiteLLMUrl { get; set; } =
         "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
