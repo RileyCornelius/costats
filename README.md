@@ -16,7 +16,7 @@ A lightweight Windows tray app that shows live status, plus token usage and spen
 
 **One-step PowerShell (technical)**
 ```powershell
-iwr -useb https://raw.githubusercontent.com/fmdz387/costats/master/scripts/install.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/RileyCornelius/costats/master/scripts/install.ps1 | iex
 ```
 Downloads the latest release, installs per-user and creates a Start Menu shortcut.
 Portable installs now auto-check for updates in the background on startup and stage updates safely for the next launch.

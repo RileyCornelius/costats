@@ -302,6 +302,20 @@ public static class CopilotOtelDigestor
             }
         }
 
+        foreach (var key in keys)
+        {
+            var suffix = $".{key}";
+            foreach (var field in fields)
+            {
+                if (field.Key.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(field.Value))
+                {
+                    value = field.Value;
+                    return true;
+                }
+            }
+        }
+
         value = string.Empty;
         return false;
     }
