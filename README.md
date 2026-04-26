@@ -3,7 +3,7 @@
 A lightweight Windows tray app that shows live status, plus token usage and spend, for AI coding providers like Codex and Claude Code, optionally GitHub Copilot.
 
 <p align="center">
-  <img src="assets/image.png" alt="costats widget screenshot" width="360" />
+  <img src="assets/app.png" alt="costats app screenshot" height="420" />
 </p>
 
 ## What it shows
