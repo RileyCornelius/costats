@@ -34,6 +34,7 @@ namespace costats.App
         private StartupUpdateCoordinator? _updateCoordinator;
         private ThemeService? _themeService;
         private bool _launchedAtLogin;
+        private bool _skipUpdateApply;
 
         protected override void OnStartup(System.Windows.StartupEventArgs e)
         {
@@ -44,6 +45,11 @@ namespace costats.App
             // start hidden in the tray instead of popping the widget open.
             _launchedAtLogin = e.Args.Any(
                 arg => string.Equals(arg, StartupRegistration.AutoStartFlag, StringComparison.OrdinalIgnoreCase));
+
+            // The updater relaunches us with this flag after a failed apply — skip the automatic
+            // startup apply this run so we don't immediately re-trigger and race the updater.
+            _skipUpdateApply = e.Args.Any(
+                arg => string.Equals(arg, StartupUpdateCoordinator.SkipUpdateApplyFlag, StringComparison.OrdinalIgnoreCase));
 
             BootstrapEarlyLogger();
             RegisterExceptionHandlers();
@@ -106,7 +112,11 @@ namespace costats.App
             {
                 var startupConfiguration = BuildStartupConfiguration();
                 _updateCoordinator = new StartupUpdateCoordinator(UpdateOptions.FromConfiguration(startupConfiguration));
-                if (await _updateCoordinator.TryApplyPendingUpdateAsync(CancellationToken.None).ConfigureAwait(false))
+                if (_skipUpdateApply)
+                {
+                    Log.Information("Relaunched after a failed update apply — skipping automatic startup apply this run");
+                }
+                else if (await _updateCoordinator.TryApplyPendingUpdateAsync(CancellationToken.None).ConfigureAwait(false))
                 {
                     Log.Information("Pending update is being applied, shutting down for update");
                     await Dispatcher.InvokeAsync(() => Shutdown(0));
