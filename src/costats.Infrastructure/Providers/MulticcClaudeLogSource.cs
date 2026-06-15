@@ -45,17 +45,26 @@ public sealed class MulticcClaudeLogSource : ISignalSource, IDisposable
         var logResult = await _scanner.ScanClaudeAsync(_profile.ConfigDir, cancellationToken).ConfigureAwait(false);
         var consumption = await SafeAnalyzeExpenseAsync(cancellationToken).ConfigureAwait(false);
 
-        var oauthResult = await oauthTask.ConfigureAwait(false);
+        var outcome = await oauthTask.ConfigureAwait(false);
+        var oauthResult = outcome.Result;
+        var signInRequired = ClaudeIdentity.IsSignInRequired(outcome.Status);
 
         if (oauthResult is null && logResult.SessionTokens == 0 && logResult.WeekTokens == 0)
         {
+            // Nothing local either — but if the reason is a dead login, say so loudly.
+            var planOnly = ClaudeIdentity.FormatPlan(outcome.SubscriptionType);
             return new ProviderReading(
                 Usage: null,
-                Identity: null,
-                StatusSummary: $"No data for {_profile.Name}",
+                Identity: signInRequired && planOnly.Length > 0
+                    ? new IdentityCard(Profile.ProviderId, _profile.Name, null, null, planOnly, "OAuth")
+                    : null,
+                StatusSummary: signInRequired
+                    ? ClaudeIdentity.SignInMessage(outcome.Status)
+                    : $"No data for {_profile.Name}",
                 CapturedAt: now,
                 Confidence: ReadingConfidence.Low,
-                Source: ReadingSource.LocalLog);
+                Source: ReadingSource.LocalLog,
+                Alert: signInRequired ? ReadingAlert.SignInRequired : ReadingAlert.None);
         }
 
         // Prefer OAuth data for percentages
@@ -116,13 +125,27 @@ public sealed class MulticcClaudeLogSource : ISignalSource, IDisposable
             SessionWindow: sessionWindow,
             WeekWindow: weekWindow);
 
-        var planText = FormatPlanText(oauthResult?.SubscriptionType);
-        var statusSummary = oauthResult is not null
-            ? $"Updated {FormatRelativeTime(oauthResult.FetchedAt, now)}"
-            : $"Updated {FormatRelativeTime(logResult.LatestTimestamp ?? now, now)}";
-
-        var confidence = oauthResult is not null ? ReadingConfidence.High : ReadingConfidence.Medium;
+        var planText = ClaudeIdentity.FormatPlan(outcome.SubscriptionType);
         var source = oauthResult is not null ? ReadingSource.Api : ReadingSource.LocalLog;
+
+        string statusSummary;
+        ReadingConfidence confidence;
+        ReadingAlert alert;
+        if (signInRequired)
+        {
+            // Login is dead — make it obvious instead of showing stale log numbers as normal.
+            statusSummary = ClaudeIdentity.SignInMessage(outcome.Status);
+            confidence = ReadingConfidence.Low;
+            alert = ReadingAlert.SignInRequired;
+        }
+        else
+        {
+            statusSummary = oauthResult is not null
+                ? $"Updated {FormatRelativeTime(oauthResult.FetchedAt, now)}"
+                : $"Updated {FormatRelativeTime(logResult.LatestTimestamp ?? now, now)}";
+            confidence = oauthResult is not null ? ReadingConfidence.High : ReadingConfidence.Medium;
+            alert = ReadingAlert.None;
+        }
 
         return new ProviderReading(
             Usage: usage,
@@ -130,17 +153,8 @@ public sealed class MulticcClaudeLogSource : ISignalSource, IDisposable
             StatusSummary: statusSummary,
             CapturedAt: usage.CapturedAt,
             Confidence: confidence,
-            Source: source);
-    }
-
-    private static string FormatPlanText(string? subscriptionType)
-    {
-        if (string.IsNullOrEmpty(subscriptionType))
-        {
-            return "Max";
-        }
-
-        return char.ToUpper(subscriptionType[0]) + subscriptionType[1..].ToLower();
+            Source: source,
+            Alert: alert);
     }
 
     private static DateTimeOffset? CalculateSessionReset(DateTimeOffset? sessionStart, DateTimeOffset now)

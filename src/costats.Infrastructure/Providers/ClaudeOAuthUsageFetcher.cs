@@ -52,7 +52,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     }
 
     //  Public API
-    public async Task<ClaudeOAuthUsageResult?> FetchAsync(CancellationToken cancellationToken)
+    public async Task<ClaudeOAuthOutcome> FetchAsync(CancellationToken cancellationToken)
     {
         // 1. Load credentials & detect changes
         var credentials = await LoadCredentialsAsync(_configDir);
@@ -65,8 +65,18 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
             _blockedUntil = DateTimeOffset.MinValue;
         }
 
+        // No usable credentials at all — surface a sign-in prompt (with any cached usage).
+        if (credentials?.AccessToken is null)
+        {
+            return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.NoCredentials, null, null);
+        }
+
+        // Plan/tier come from the credentials file, so they survive every fetch failure.
+        var subType = credentials.SubscriptionType;
+        var tier = credentials.RateLimitTier;
+
         // 2. If token is expired, try delegated refresh via Claude CLI
-        if (credentials is not null && IsTokenExpired(credentials))
+        if (IsTokenExpired(credentials))
         {
             await TryDelegatedRefreshAsync(cancellationToken).ConfigureAwait(false);
             credentials = await LoadCredentialsAsync(_configDir);
@@ -78,41 +88,52 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
                 _consecutiveFailures = 0;
                 _blockedUntil = DateTimeOffset.MinValue;
             }
+
+            // A refresh rewrites the credential file — prefer its (possibly newer) plan info.
+            subType = credentials?.SubscriptionType ?? subType;
+            tier = credentials?.RateLimitTier ?? tier;
+
+            // Still expired after the refresh attempt (e.g. a blank/invalid refresh token)
+            // means the login is dead and only re-running `claude /login` can fix it.
+            if (credentials?.AccessToken is null || IsTokenExpired(credentials))
+            {
+                return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.Expired, subType, tier);
+            }
         }
 
         // 3. Check failure gate
         if (DateTimeOffset.UtcNow < _blockedUntil)
         {
-            return GetCachedResult();
+            return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.Unavailable, subType, tier);
         }
 
         // 4. Attempt fresh fetch
-        var fresh = await TryFetchAsync(credentials, cancellationToken).ConfigureAwait(false);
+        var (fresh, fetchStatus) = await TryFetchAsync(credentials, cancellationToken).ConfigureAwait(false);
         if (fresh is not null)
         {
             _consecutiveFailures = 0;
             _blockedUntil = DateTimeOffset.MinValue;
             SetMemoryCache(fresh);
             _ = WriteDiskCacheAsync(fresh);
-            return fresh;
+            return new ClaudeOAuthOutcome(fresh, ClaudeAuthStatus.Ok, subType, tier);
         }
 
         // 5. Record failure & compute backoff
         _consecutiveFailures++;
         _blockedUntil = DateTimeOffset.UtcNow + ComputeBackoff(_consecutiveFailures);
 
-        return GetCachedResult();
+        return new ClaudeOAuthOutcome(GetCachedResult(), fetchStatus, subType, tier);
     }
 
     //  HTTP
-    private async Task<ClaudeOAuthUsageResult?> TryFetchAsync(
+    private async Task<(ClaudeOAuthUsageResult? Result, ClaudeAuthStatus Status)> TryFetchAsync(
         ClaudeCredentials? credentials, CancellationToken cancellationToken)
     {
         try
         {
             if (credentials?.AccessToken is null || IsTokenExpired(credentials))
             {
-                return null;
+                return (null, ClaudeAuthStatus.Expired);
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -125,10 +146,18 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
             if (response.IsSuccessStatusCode)
             {
                 var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                return ParseResponse(content, credentials.SubscriptionType, credentials.RateLimitTier);
+                var parsed = ParseResponse(content, credentials.SubscriptionType, credentials.RateLimitTier);
+                return (parsed, parsed is not null ? ClaudeAuthStatus.Ok : ClaudeAuthStatus.Unavailable);
             }
 
-            return null;
+            // Distinguish a dead/rejected token from a transient server/network failure.
+            if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized
+                or System.Net.HttpStatusCode.Forbidden)
+            {
+                return (null, ClaudeAuthStatus.Unauthorized);
+            }
+
+            return (null, ClaudeAuthStatus.Unavailable);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -136,7 +165,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         }
         catch
         {
-            return null;
+            return (null, ClaudeAuthStatus.Unavailable);
         }
     }
 
@@ -540,3 +569,35 @@ public sealed record ClaudeOAuthUsageResult(
     string? SubscriptionType,
     string? RateLimitTier,
     DateTimeOffset FetchedAt);
+
+/// <summary>
+/// The authentication state of a Claude OAuth fetch attempt.
+/// </summary>
+public enum ClaudeAuthStatus
+{
+    /// <summary>Token is valid and usage was fetched.</summary>
+    Ok,
+
+    /// <summary>Access token is expired and could not be refreshed (e.g. no refresh token) — re-login required.</summary>
+    Expired,
+
+    /// <summary>The API rejected the token (401/403) — re-login required.</summary>
+    Unauthorized,
+
+    /// <summary>No credentials file / no access token present — sign-in required.</summary>
+    NoCredentials,
+
+    /// <summary>A transient network/server failure; the token itself looks fine.</summary>
+    Unavailable
+}
+
+/// <summary>
+/// The result of a Claude OAuth fetch. Carries usage data when available plus the
+/// authentication status and the credential-sourced plan info, which remain meaningful
+/// even when the usage API call itself failed.
+/// </summary>
+public sealed record ClaudeOAuthOutcome(
+    ClaudeOAuthUsageResult? Result,
+    ClaudeAuthStatus Status,
+    string? SubscriptionType,
+    string? RateLimitTier);

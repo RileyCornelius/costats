@@ -6,4 +6,5 @@ public sealed record ProviderReading(
     string? StatusSummary,
     DateTimeOffset CapturedAt,
     ReadingConfidence Confidence,
-    ReadingSource Source);
+    ReadingSource Source,
+    ReadingAlert Alert = ReadingAlert.None);

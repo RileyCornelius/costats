@@ -17,6 +17,10 @@ public sealed partial class ProviderPulseViewModel : ObservableObject
     [ObservableProperty]
     private string planText = string.Empty;
 
+    // True when the provider's login is expired/missing — drives the prominent warning treatment.
+    [ObservableProperty]
+    private bool needsSignIn;
+
     // Session metrics
     [ObservableProperty]
     private double sessionProgress;
@@ -132,7 +136,8 @@ public sealed partial class ProviderPulseViewModel : ObservableObject
             ProviderId = reading.Usage?.ProviderId ?? displayNameFallback,
             DisplayName = displayNameFallback,
             StatusSummary = FormatStatusSummary(reading),
-            PlanText = reading.Identity?.Plan ?? "Max"
+            PlanText = reading.Identity?.Plan ?? string.Empty,
+            NeedsSignIn = reading.Alert == ReadingAlert.SignInRequired
         };
 
         PopulateSessionMetrics(vm, reading);

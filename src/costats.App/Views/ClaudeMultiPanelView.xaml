@@ -6,6 +6,16 @@
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter" />
 
+        <!-- Dims a profile's usage metrics when its login needs re-auth (stale numbers). -->
+        <Style x:Key="SignInDimmedPanel" TargetType="StackPanel">
+            <Setter Property="Opacity" Value="1" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding NeedsSignIn}" Value="True">
+                    <Setter Property="Opacity" Value="0.4" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
         <!-- Progress bar style -->
         <Style x:Key="MetricProgressBar" TargetType="ProgressBar">
             <Setter Property="Height" Value="7" />
@@ -85,6 +95,15 @@
                                                    Foreground="{DynamicResource ClaudeChipTextBrush}" />
                                     </Border>
 
+                                    <TextBlock Text="&#x26A0;"
+                                               DockPanel.Dock="Left"
+                                               FontSize="12"
+                                               Margin="0,0,5,0"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource WarningBrush}"
+                                               ToolTip="{Binding StatusSummary}"
+                                               Visibility="{Binding NeedsSignIn, Converter={StaticResource BoolToVisibilityConverter}}" />
+
                                     <TextBlock Text="{Binding DisplayName}"
                                                FontSize="14"
                                                FontWeight="SemiBold"
@@ -94,7 +113,7 @@
                                 </DockPanel>
 
                                 <!-- Session metric -->
-                                <StackPanel Margin="0,0,0,8">
+                                <StackPanel Margin="0,0,0,8" Style="{StaticResource SignInDimmedPanel}">
                                     <DockPanel>
                                         <TextBlock Text="Session"
                                                    FontSize="11"
@@ -127,7 +146,7 @@
                                 </StackPanel>
 
                                 <!-- Weekly metric -->
-                                <StackPanel>
+                                <StackPanel Style="{StaticResource SignInDimmedPanel}">
                                     <DockPanel>
                                         <TextBlock Text="Weekly"
                                                    FontSize="11"
