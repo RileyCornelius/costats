@@ -68,14 +68,13 @@ public static class StartupRegistration
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKey, true);
             if (key is null) return;
-            if (key.GetValue(AppName) is not string) return; // not enabled — nothing to heal
+            if (key.GetValue(AppName) is not string current) return; // not enabled — nothing to heal
 
             var exePath = Environment.ProcessPath;
             if (string.IsNullOrEmpty(exePath)) return;
 
             var desired = $"\"{exePath}\" {AutoStartFlag}";
-            if (key.GetValue(AppName) is string current
-                && !string.Equals(current, desired, StringComparison.Ordinal))
+            if (!string.Equals(current, desired, StringComparison.Ordinal))
             {
                 key.SetValue(AppName, desired);
             }

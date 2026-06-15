@@ -2,7 +2,6 @@ using costats.Application.Pulse;
 using costats.Core.Pulse;
 using costats.Infrastructure.Expense;
 using costats.Infrastructure.Usage;
-using static costats.Core.Pulse.UsageFormatter;
 
 namespace costats.Infrastructure.Providers;
 
@@ -35,24 +34,11 @@ public sealed class ClaudeLogSource : ISignalSource
 
         var outcome = await oauthTask.ConfigureAwait(false);
         var oauthResult = outcome.Result;
-        var signInRequired = ClaudeIdentity.IsSignInRequired(outcome.Status);
 
         if (oauthResult is null && logResult.SessionTokens == 0 && logResult.WeekTokens == 0)
         {
-            // Nothing local either — but if the reason is a dead login, say so loudly.
-            var planOnly = ClaudeIdentity.FormatPlan(outcome.SubscriptionType);
-            return new ProviderReading(
-                Usage: null,
-                Identity: signInRequired && planOnly.Length > 0
-                    ? new IdentityCard(Profile.ProviderId, Profile.DisplayName, null, null, planOnly, "OAuth")
-                    : null,
-                StatusSummary: signInRequired
-                    ? ClaudeIdentity.SignInMessage(outcome.Status)
-                    : "No Claude usage data available",
-                CapturedAt: now,
-                Confidence: ReadingConfidence.Low,
-                Source: ReadingSource.LocalLog,
-                Alert: signInRequired ? ReadingAlert.SignInRequired : ReadingAlert.None);
+            return ClaudeIdentity.BuildEmptyReading(
+                outcome, Profile.ProviderId, Profile.DisplayName, "No Claude usage data available", now);
         }
 
         // Prefer OAuth data for percentages
@@ -117,25 +103,8 @@ public sealed class ClaudeLogSource : ISignalSource
 
         var planText = ClaudeIdentity.FormatPlan(outcome.SubscriptionType);
         var source = oauthResult is not null ? ReadingSource.Api : ReadingSource.LocalLog;
-
-        string statusSummary;
-        ReadingConfidence confidence;
-        ReadingAlert alert;
-        if (signInRequired)
-        {
-            // Login is dead — make it obvious instead of showing stale log numbers as normal.
-            statusSummary = ClaudeIdentity.SignInMessage(outcome.Status);
-            confidence = ReadingConfidence.Low;
-            alert = ReadingAlert.SignInRequired;
-        }
-        else
-        {
-            statusSummary = oauthResult is not null
-                ? $"Updated {FormatRelativeTime(oauthResult.FetchedAt, now)}"
-                : $"Updated {FormatRelativeTime(logResult.LatestTimestamp ?? now, now)}";
-            confidence = oauthResult is not null ? ReadingConfidence.High : ReadingConfidence.Medium;
-            alert = ReadingAlert.None;
-        }
+        var (statusSummary, confidence, alert) =
+            ClaudeIdentity.ResolveStatus(outcome, oauthResult, logResult.LatestTimestamp, now);
 
         return new ProviderReading(
             Usage: usage,

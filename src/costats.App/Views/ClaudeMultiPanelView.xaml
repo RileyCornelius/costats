@@ -6,16 +6,6 @@
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter" />
 
-        <!-- Dims a profile's usage metrics when its login needs re-auth (stale numbers). -->
-        <Style x:Key="SignInDimmedPanel" TargetType="StackPanel">
-            <Setter Property="Opacity" Value="1" />
-            <Style.Triggers>
-                <DataTrigger Binding="{Binding NeedsSignIn}" Value="True">
-                    <Setter Property="Opacity" Value="0.4" />
-                </DataTrigger>
-            </Style.Triggers>
-        </Style>
-
         <!-- Progress bar style -->
         <Style x:Key="MetricProgressBar" TargetType="ProgressBar">
             <Setter Property="Height" Value="7" />
