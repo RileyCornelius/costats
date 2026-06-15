@@ -33,11 +33,17 @@ namespace costats.App
         private SingleInstanceCoordinator? _singleInstance;
         private StartupUpdateCoordinator? _updateCoordinator;
         private ThemeService? _themeService;
+        private bool _launchedAtLogin;
 
         protected override void OnStartup(System.Windows.StartupEventArgs e)
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
             base.OnStartup(e);
+
+            // When Windows auto-starts us at login the registered command carries this flag —
+            // start hidden in the tray instead of popping the widget open.
+            _launchedAtLogin = e.Args.Any(
+                arg => string.Equals(arg, StartupRegistration.AutoStartFlag, StringComparison.OrdinalIgnoreCase));
 
             BootstrapEarlyLogger();
             RegisterExceptionHandlers();
@@ -110,6 +116,10 @@ namespace costats.App
                 var settingsStore = new JsonSettingsStore();
                 var settings = await settingsStore.LoadAsync(CancellationToken.None).ConfigureAwait(false);
 
+                // Heal start-at-login entries from older versions / stale paths so future
+                // login launches carry the auto-start flag and start hidden.
+                StartupRegistration.SyncIfEnabled();
+
                 await Dispatcher.InvokeAsync(() =>
                 {
                     _themeService = new ThemeService(this);
@@ -117,7 +127,12 @@ namespace costats.App
 
                     var tray = InitializeHost(settingsStore, settings, _themeService);
                     LogFireAndForget(StartListenerAsync(tray), "SingleInstanceListener");
-                    tray.ShowWidget();
+
+                    // Stay in the tray on a login launch; show the widget for a manual launch.
+                    if (!_launchedAtLogin)
+                    {
+                        tray.ShowWidget();
+                    }
                 });
 
                 if (_updateCoordinator is not null)

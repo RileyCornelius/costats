@@ -10,7 +10,6 @@ using costats.Application.Security;
 using costats.Application.Settings;
 using costats.Core.Pulse;
 using costats.Infrastructure.Providers;
-using Microsoft.Win32;
 using System.Linq;
 
 namespace costats.App.ViewModels;
@@ -25,8 +24,6 @@ public sealed partial class SettingsViewModel : ObservableObject
     private readonly ThemeService _themeService;
     private readonly StartupUpdateCoordinator? _updateCoordinator;
     private readonly IMulticcDiscovery? _multiccDiscovery;
-    private const string StartupRegistryKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
-    private const string AppName = "costats";
 
     public SettingsViewModel(
         ISettingsStore settingsStore,
@@ -49,7 +46,7 @@ public sealed partial class SettingsViewModel : ObservableObject
 
         appThemeMode = settings.AppThemeMode;
         refreshMinutes = settings.RefreshMinutes;
-        startAtLogin = GetStartupRegistryValue();
+        startAtLogin = StartupRegistration.IsEnabled();
 
         multiccDetected = _multiccDiscovery?.IsDetected ?? false;
         multiccEnabled = settings.MulticcEnabled;
@@ -176,7 +173,7 @@ public sealed partial class SettingsViewModel : ObservableObject
     partial void OnStartAtLoginChanged(bool value)
     {
         _settings.StartAtLogin = value;
-        SetStartupRegistryValue(value);
+        StartupRegistration.SetEnabled(value);
         _ = SaveSettingsAsync();
     }
 
@@ -350,44 +347,6 @@ public sealed partial class SettingsViewModel : ObservableObject
         await _settingsStore.SaveAsync(_settings, CancellationToken.None);
     }
 
-    private static bool GetStartupRegistryValue()
-    {
-        try
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(StartupRegistryKey, false);
-            return key?.GetValue(AppName) is not null;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static void SetStartupRegistryValue(bool enable)
-    {
-        try
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(StartupRegistryKey, true);
-            if (key is null) return;
-
-            if (enable)
-            {
-                var exePath = Environment.ProcessPath;
-                if (!string.IsNullOrEmpty(exePath))
-                {
-                    key.SetValue(AppName, $"\"{exePath}\"");
-                }
-            }
-            else
-            {
-                key.DeleteValue(AppName, false);
-            }
-        }
-        catch
-        {
-            // Silently ignore registry errors
-        }
-    }
 }
 
 public sealed record RefreshOption(int Minutes, string Label)
