@@ -23,12 +23,19 @@ public sealed class PricingRefreshService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await RefreshSafelyAsync(stoppingToken).ConfigureAwait(false);
-
-        using var timer = new PeriodicTimer(_options.Value.RefreshInterval);
-        while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false))
+        try
         {
             await RefreshSafelyAsync(stoppingToken).ConfigureAwait(false);
+
+            using var timer = new PeriodicTimer(_options.Value.RefreshInterval);
+            while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false))
+            {
+                await RefreshSafelyAsync(stoppingToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Normal shutdown — PeriodicTimer.WaitForNextTickAsync throws when the token cancels.
         }
     }
 
