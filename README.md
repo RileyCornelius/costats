@@ -99,5 +99,21 @@ dotnet build .\costats.sln -c Release
 .\scripts\publish.ps1
 ```
 
+## Release
+
+```powershell
+# 1. Bump the version
+.\scripts\bump-version.ps1 -Version 1.5.2
+
+# 2. Commit the bump
+git add src/Directory.Build.props
+git commit -m "Bump v1.5.2"
+
+# 3. Push the branch and the release tag
+git push origin master
+git tag v1.5.2
+git push origin v1.5.2 # <- triggers the Release workflow
+```
+
 ## Linux/MacOS
 - [CodexBar](https://github.com/steipete/CodexBar) is an original MacOS/Linux app for stats.

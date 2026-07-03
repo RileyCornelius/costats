@@ -36,5 +36,14 @@ namespace costats.App
                 await viewModel.SaveCopilotTokenAsync(token);
             }
         }
+
+        private async void OnSaveCursorTokenClick(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is SettingsViewModel viewModel)
+            {
+                var token = CursorTokenBox.Password;
+                await viewModel.SaveCursorTokenAsync(token);
+            }
+        }
     }
 }

@@ -20,6 +20,7 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
         _orchestrator = orchestrator;
         _settings = settings;
         isCopilotEnabled = settings.CopilotEnabled;
+        isCursorEnabled = settings.CursorEnabled;
         _displayNames = sources
             .Select(source => source.Profile)
             .GroupBy(profile => profile.ProviderId)
@@ -44,6 +45,9 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
     private ProviderPulseViewModel copilot = new();
 
     [ObservableProperty]
+    private ProviderPulseViewModel cursor = new();
+
+    [ObservableProperty]
     private string updatedLabel = "Updated never";
 
     [ObservableProperty]
@@ -57,6 +61,9 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
 
     [ObservableProperty]
     private bool isCopilotEnabled;
+
+    [ObservableProperty]
+    private bool isCursorEnabled;
 
     [ObservableProperty]
     private string multiccSummary = string.Empty;
@@ -86,7 +93,9 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
     {
         0 => Codex,
         1 => Claude,
-        _ => IsCopilotEnabled ? Copilot : Codex
+        2 => IsCopilotEnabled ? Copilot : Codex,
+        3 => IsCursorEnabled ? Cursor : Codex,
+        _ => Codex
     };
 
     /// <summary>
@@ -108,7 +117,10 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
                 return "claude";
             }
 
-            return IsCopilotEnabled ? "copilot" : "codex";
+            if (SelectedTabIndex == 2)
+                return IsCopilotEnabled ? "copilot" : "codex";
+
+            return IsCursorEnabled ? "cursor" : "codex";
         }
     }
 
@@ -161,7 +173,8 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
         System.Windows.Application.Current.Dispatcher.BeginInvoke(() =>
         {
             IsCopilotEnabled = _settings.CopilotEnabled;
-            if (!IsCopilotEnabled && SelectedTabIndex > 1)
+            IsCursorEnabled = _settings.CursorEnabled;
+            if ((SelectedTabIndex == 2 && !IsCopilotEnabled) || (SelectedTabIndex == 3 && !IsCursorEnabled))
             {
                 SelectedTabIndex = 0;
             }
@@ -177,6 +190,7 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
                 ProviderPulseViewModel? newCodex = null;
                 ProviderPulseViewModel? newClaude = null;
                 ProviderPulseViewModel? newCopilot = null;
+                ProviderPulseViewModel? newCursor = null;
 
                 // Aggregate cost/token totals across multicc profiles
                 decimal totalTodayCost = 0;
@@ -196,6 +210,11 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
                         continue;
                     }
 
+                    if (providerId.Equals("cursor", StringComparison.OrdinalIgnoreCase) && !IsCursorEnabled)
+                    {
+                        continue;
+                    }
+
                     newProviders.Add(vm);
 
                     if (providerId.Equals("codex", StringComparison.OrdinalIgnoreCase))
@@ -209,6 +228,10 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
                     else if (providerId.Equals("copilot", StringComparison.OrdinalIgnoreCase))
                     {
                         newCopilot = vm;
+                    }
+                    else if (providerId.Equals("cursor", StringComparison.OrdinalIgnoreCase))
+                    {
+                        newCursor = vm;
                     }
                     else if (providerId.StartsWith("claude:", StringComparison.OrdinalIgnoreCase))
                     {
@@ -264,6 +287,7 @@ public sealed partial class PulseViewModel : ObservableObject, IObserver<PulseSt
                 if (newCodex is not null) Codex = newCodex;
                 if (newClaude is not null) Claude = newClaude;
                 if (newCopilot is not null) Copilot = newCopilot;
+                if (newCursor is not null) Cursor = newCursor;
                 IsMulticcActive = isMulticc;
                 MulticcSummary = summaryText;
 

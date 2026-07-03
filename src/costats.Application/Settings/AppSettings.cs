@@ -28,4 +28,9 @@ public sealed class AppSettings
     /// Whether the GitHub Copilot personal usage provider is enabled.
     /// </summary>
     public bool CopilotEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Whether the Cursor usage provider is enabled.
+    /// </summary>
+    public bool CursorEnabled { get; set; } = false;
 }

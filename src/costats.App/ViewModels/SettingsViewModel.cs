@@ -10,6 +10,7 @@ using costats.Application.Security;
 using costats.Application.Settings;
 using costats.Core.Pulse;
 using costats.Infrastructure.Providers;
+using costats.Infrastructure.Providers.Cursor;
 using System.Linq;
 
 namespace costats.App.ViewModels;
@@ -21,6 +22,7 @@ public sealed partial class SettingsViewModel : ObservableObject
     private readonly IPulseOrchestrator _pulseOrchestrator;
     private readonly ICredentialVault _credentialVault;
     private readonly CopilotUsageFetcher _copilotFetcher;
+    private readonly CursorUsageFetcher _cursorFetcher;
     private readonly ThemeService _themeService;
     private readonly StartupUpdateCoordinator? _updateCoordinator;
     private readonly IMulticcDiscovery? _multiccDiscovery;
@@ -32,6 +34,7 @@ public sealed partial class SettingsViewModel : ObservableObject
         ICredentialVault credentialVault,
         ThemeService themeService,
         CopilotUsageFetcher copilotFetcher,
+        CursorUsageFetcher cursorFetcher,
         StartupUpdateCoordinator? updateCoordinator = null,
         IMulticcDiscovery? multiccDiscovery = null)
     {
@@ -41,6 +44,7 @@ public sealed partial class SettingsViewModel : ObservableObject
         _credentialVault = credentialVault;
         _themeService = themeService;
         _copilotFetcher = copilotFetcher;
+        _cursorFetcher = cursorFetcher;
         _updateCoordinator = updateCoordinator;
         _multiccDiscovery = multiccDiscovery;
 
@@ -56,6 +60,9 @@ public sealed partial class SettingsViewModel : ObservableObject
 
         copilotEnabled = settings.CopilotEnabled;
         _ = LoadCopilotTokenStatusAsync();
+
+        cursorEnabled = settings.CursorEnabled;
+        _ = LoadCursorTokenStatusAsync();
     }
 
     [ObservableProperty]
@@ -102,6 +109,18 @@ public sealed partial class SettingsViewModel : ObservableObject
 
     [ObservableProperty]
     private bool isCopilotTokenBusy;
+
+    [ObservableProperty]
+    private bool cursorEnabled;
+
+    [ObservableProperty]
+    private bool hasCursorToken;
+
+    [ObservableProperty]
+    private string cursorTokenStatus = string.Empty;
+
+    [ObservableProperty]
+    private bool isCursorTokenBusy;
 
     public bool IsMulticcAllProfiles => MulticcSelectedProfile is null;
 
@@ -197,6 +216,79 @@ public sealed partial class SettingsViewModel : ObservableObject
         _settings.CopilotEnabled = value;
         _ = SaveSettingsAsync();
         _ = _pulseOrchestrator.RefreshOnceAsync(RefreshTrigger.Silent, CancellationToken.None);
+    }
+
+    partial void OnCursorEnabledChanged(bool value)
+    {
+        _settings.CursorEnabled = value;
+        _ = SaveSettingsAsync();
+        _ = _pulseOrchestrator.RefreshOnceAsync(RefreshTrigger.Silent, CancellationToken.None);
+    }
+
+    public async Task SaveCursorTokenAsync(string token)
+    {
+        var normalized = CursorCredentialReader.NormalizeManualToken(token);
+        if (normalized is null)
+        {
+            CursorTokenStatus = "Cursor session token is required.";
+            return;
+        }
+
+        IsCursorTokenBusy = true;
+        try
+        {
+            await _credentialVault.SaveAsync(CredentialKeys.CursorToken, normalized, CancellationToken.None);
+            var validation = await _cursorFetcher.FetchAsync(normalized, CancellationToken.None);
+            HasCursorToken = true;
+            CursorTokenStatus = validation.Status == CursorFetchStatus.Success
+                ? "Cursor session token saved."
+                : validation.StatusSummary;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Cursor token save failed: {ex.Message}");
+            CursorTokenStatus = "Could not save Cursor session token.";
+        }
+        finally
+        {
+            IsCursorTokenBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task ClearCursorTokenAsync()
+    {
+        IsCursorTokenBusy = true;
+        try
+        {
+            await _credentialVault.SaveAsync(CredentialKeys.CursorToken, string.Empty, CancellationToken.None);
+            HasCursorToken = false;
+            CursorTokenStatus = "Cursor session token cleared.";
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Cursor token clear failed: {ex.Message}");
+            CursorTokenStatus = "Could not clear Cursor session token.";
+        }
+        finally
+        {
+            IsCursorTokenBusy = false;
+        }
+    }
+
+    private async Task LoadCursorTokenStatusAsync()
+    {
+        try
+        {
+            var token = await _credentialVault.LoadAsync(CredentialKeys.CursorToken, CancellationToken.None);
+            HasCursorToken = !string.IsNullOrWhiteSpace(token);
+            CursorTokenStatus = string.Empty;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Cursor token load failed: {ex.Message}");
+            CursorTokenStatus = "Could not load Cursor session token.";
+        }
     }
 
     public async Task SaveCopilotTokenAsync(string token)

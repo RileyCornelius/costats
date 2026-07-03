@@ -459,6 +459,72 @@
                            Visibility="{Binding CopilotTokenStatus, Converter={x:Static local:StringToVisibilityConverter.Instance}}" />
 
                 <!-- Divider -->
+                <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,16,0,16" />
+
+                <!-- Cursor section -->
+                <TextBlock Text="CURSOR"
+                           FontSize="10"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource TextMutedBrush}"
+                           Margin="0,0,0,12" />
+
+                <CheckBox IsChecked="{Binding CursorEnabled}" Style="{StaticResource SettingsCheckBox}" Margin="0,0,0,6">
+                    <TextBlock Text="Enable Cursor usage" FontSize="12" Foreground="{DynamicResource TextPrimaryBrush}" />
+                </CheckBox>
+                <TextBlock Text="Usage is read automatically from your local Cursor install. A session token is only needed if auto-detection fails."
+                           FontSize="11"
+                           Foreground="{DynamicResource TextFaintBrush}"
+                           Margin="0,0,0,12"
+                           TextWrapping="Wrap" />
+
+                <TextBlock Text="Session token (optional)" FontSize="12" Foreground="{DynamicResource TextPrimaryBrush}" />
+                <Grid Margin="0,6,0,8">
+                    <PasswordBox x:Name="CursorTokenBox"
+                                 Style="{StaticResource SettingsPasswordBox}"
+                                 IsEnabled="{Binding IsCursorTokenBusy, Converter={x:Static local:BoolNegationConverter.Instance}}" />
+                    <TextBlock Text="********"
+                               FontSize="12"
+                               Foreground="{DynamicResource TextFaintBrush}"
+                               Margin="10,0,10,0"
+                               HorizontalAlignment="Left"
+                               VerticalAlignment="Center"
+                               IsHitTestVisible="False">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasCursorToken}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding ElementName=CursorTokenBox, Path=IsKeyboardFocused}" Value="True">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Grid>
+
+                <DockPanel Margin="0,0,0,6">
+                    <Button Content="Save token"
+                            Click="OnSaveCursorTokenClick"
+                            IsEnabled="{Binding IsCursorTokenBusy, Converter={x:Static local:BoolNegationConverter.Instance}}"
+                            Style="{StaticResource SettingsButton}"
+                            Margin="0,0,6,0"
+                            DockPanel.Dock="Left" />
+                    <Button Content="Clear token"
+                            Command="{Binding ClearCursorTokenCommand}"
+                            IsEnabled="{Binding IsCursorTokenBusy, Converter={x:Static local:BoolNegationConverter.Instance}}"
+                            Style="{StaticResource SettingsButton}"
+                            DockPanel.Dock="Right" />
+                </DockPanel>
+
+                <TextBlock Text="{Binding CursorTokenStatus}"
+                           FontSize="11"
+                           Foreground="{DynamicResource TextFaintBrush}"
+                           Visibility="{Binding CursorTokenStatus, Converter={x:Static local:StringToVisibilityConverter.Instance}}" />
+
+                <!-- Divider -->
                 <Border Height="1" Background="{StaticResource DividerBrush}" Margin="0,16,0,16" />
 
                 <!-- Updates Section -->

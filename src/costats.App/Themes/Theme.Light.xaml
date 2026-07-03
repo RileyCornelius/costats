@@ -37,4 +37,6 @@
     <SolidColorBrush x:Key="ClaudeChipTextBrush" Color="#C2410C" />
     <SolidColorBrush x:Key="CopilotChipBackgroundBrush" Color="#1F6E40C9" />
     <SolidColorBrush x:Key="CopilotChipTextBrush" Color="#4C1D95" />
+    <SolidColorBrush x:Key="CursorChipBackgroundBrush" Color="#1F64748B" />
+    <SolidColorBrush x:Key="CursorChipTextBrush" Color="#334155" />
 </ResourceDictionary>

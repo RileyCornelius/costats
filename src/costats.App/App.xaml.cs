@@ -13,6 +13,7 @@ using costats.Application.Shell;
 using costats.Core.Pulse;
 using costats.Infrastructure.Expense;
 using costats.Infrastructure.Providers;
+using costats.Infrastructure.Providers.Cursor;
 using costats.Infrastructure.Pricing;
 using costats.Infrastructure.Pulse;
 using costats.Infrastructure.Security;
@@ -269,6 +270,7 @@ namespace costats.App
         {
             services.AddSingleton<ISignalSource, CodexLogSource>();
             services.AddSingleton<ISignalSource, CopilotPersonalSource>();
+            services.AddSingleton<ISignalSource, CursorUsageSource>();
             services.AddSingleton<MulticcConfigReader>();
 
             var discovery = DiscoverMulticcProfiles(settings);
@@ -353,6 +355,8 @@ namespace costats.App
                     services.AddSingleton<PulseBroadcaster>();
                     services.AddSingleton<ISourceSelector, SourceSelector>();
                     services.AddSingleton<CopilotUsageFetcher>();
+                    services.AddSingleton<CursorUsageFetcher>();
+                    services.AddSingleton<CursorCredentialReader>();
                     AddSignalSources(services, settings);
                     services.AddSingleton<IPulseSnapshotWriter, JsonPulseSnapshotWriter>();
                     services.AddSingleton<IPulseOrchestrator, PulseOrchestrator>();
