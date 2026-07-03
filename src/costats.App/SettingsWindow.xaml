@@ -321,16 +321,6 @@
                            FontSize="11"
                            Foreground="{DynamicResource TextFaintBrush}" />
 
-                <!-- Divider -->
-                <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,16,0,16" />
-
-                <!-- Claude Code section -->
-                <TextBlock Text="CLAUDE CODE"
-                           FontSize="10"
-                           FontWeight="SemiBold"
-                           Foreground="{DynamicResource TextMutedBrush}"
-                           Margin="0,0,0,12" />
-
                 <StackPanel>
                     <StackPanel.Style>
                         <Style TargetType="StackPanel">
@@ -342,6 +332,17 @@
                             </Style.Triggers>
                         </Style>
                     </StackPanel.Style>
+
+                    <!-- Divider -->
+                    <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,16,0,16" />
+
+                    <!-- Claude Code section -->
+                    <TextBlock Text="CLAUDE CODE"
+                               FontSize="10"
+                               FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               Margin="0,0,0,12" />
+
                     <CheckBox IsChecked="{Binding MulticcEnabled}" Style="{StaticResource SettingsCheckBox}" Margin="0,0,0,6">
                         <TextBlock Text="Use multicc profiles" FontSize="12" Foreground="{DynamicResource TextPrimaryBrush}" />
                     </CheckBox>
@@ -373,23 +374,6 @@
                                Foreground="{DynamicResource WarningBrush}"
                                Margin="0,8,0,0"
                                Visibility="{Binding MulticcRestartMessage, Converter={x:Static local:StringToVisibilityConverter.Instance}}" />
-                </StackPanel>
-
-                <StackPanel>
-                    <StackPanel.Style>
-                        <Style TargetType="StackPanel">
-                            <Setter Property="Visibility" Value="Collapsed" />
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding MulticcDetected}" Value="False">
-                                    <Setter Property="Visibility" Value="Visible" />
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </StackPanel.Style>
-                    <TextBlock Text="multicc not detected. Install multicc to manage multiple Claude Code accounts."
-                               FontSize="11"
-                               Foreground="{DynamicResource TextFaintBrush}"
-                               TextWrapping="Wrap" />
                 </StackPanel>
 
                 <!-- Divider -->
