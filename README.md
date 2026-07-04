@@ -1,6 +1,6 @@
 # costats <img src="src/costats.App/Resources/tray-icon.ico" width="20" height="20" alt="costats icon" />
 
-A lightweight Windows tray app that shows live status, plus token usage and spend, for AI coding providers like Codex and Claude Code, optionally GitHub Copilot.
+A lightweight Windows tray app that shows live status, plus token usage and spend, for AI coding providers like Codex and Claude Code, optionally GitHub Copilot and Cursor.
 
 <p align="center">
   <img src="assets/app.png" alt="costats app screenshot" height="420" />
@@ -28,25 +28,6 @@ Portable installs now auto-check for updates in the background on startup and st
 - Press `Ctrl+Alt+U` to toggle the widget (configurable).
 - Open Settings to set refresh interval or start at login.
 
-## Insights Card CLI
-Generate a shareable Claude Code Insights card from `report.html` ([full docs](tools/insights-cli/README.md)):
-
-<p align="center">
-  <img src="tools/insights-cli/assets/costats-insights.png" alt="costats insights card example" width="400" />
-</p>
-
-```powershell
-npx costats ccinsights
-```
-
-By default it reads `~/.claude/usage-data/report.html` and writes the PNG to `~/.costats/images/costats-insights.png`.
-
-Optional flags:
-- `--json <path>` to export the extracted JSON alongside the PNG.
-- `--no-open` to avoid opening the image viewer.
-Requires an active Claude Code OAuth login (uses `~/.claude/.credentials.json`).
-First run may download a Playwright Chromium binary for rendering.
-
 ## Configuration
 Settings are stored at:
 `%LOCALAPPDATA%\costats\settings.json`
@@ -56,36 +37,39 @@ Common settings:
 - `Hotkey` (default `Ctrl+Alt+U`)
 - `StartAtLogin` (true/false)
 - `CopilotEnabled` (true/false)
+- `CursorEnabled` (true/false)
 
-Optional environment variable:
-- `CODEX_HOME` to point to a custom Codex config/logs directory.
-
-## GitHub Copilot (experimental)
+## GitHub Copilot
 1. Create a **classic** GitHub personal access token with the **`copilot`** and **`read:user`** scopes.
 2. Open Settings → Copilot, enable the provider, and paste the token.
 3. Tokens are stored in Windows Credential Manager (not in `settings.json`).
 4. This relies on an unofficial GitHub endpoint and may break without notice.
 
-## Updates
-- Portable ZIP installs (`install.ps1`): on startup, costats checks GitHub Releases (default every 6 hours), stages a matching architecture update and applies it on the next startup via an external updater process so binaries can be replaced safely.
-- Integrity: if release checksum assets are present (`.sha256`), costats validates SHA-256 before staging.
-- Rollback safety: updater swap uses backup/rollback logic and writes logs to `%LOCALAPPDATA%\costats\updates\apply-update.log`.
-- MSIX/AppInstaller installs: `costats.appinstaller` uses OnLaunch checks and background update tasks managed by Windows App Installer.
-- Update policy can be configured in `appsettings.json` under `Costats:Update` (`Enabled`, `Repository`, `CheckIntervalHours`, `AllowPrerelease`, `ApplyStagedUpdateOnStartup`).
+More details in [docs/COPILOT.md](docs/COPILOT.md).
+
+## Cursor
+1. Open Settings → Cursor and enable the provider.
+2. If Cursor is installed and signed in on this machine, the session token is detected automatically from Cursor's local state database — no setup needed.
+3. Otherwise, paste the `WorkosCursorSessionToken` cookie from cursor.com into Settings → Cursor. Tokens are stored in Windows Credential Manager.
+4. This relies on unofficial cursor.com web endpoints and may break without notice.
+
+Setup and troubleshooting details in [docs/CURSOR.md](docs/CURSOR.md).
 
 ## Data sources
 - Codex usage: OAuth usage endpoint via `~/.codex/auth.json` (or `CODEX_HOME`), with local logs as a fallback for estimates.
 - Claude usage: OAuth usage endpoint via `~/.claude/.credentials.json`, with local logs as a fallback for estimates.
-- Copilot usage: GitHub Copilot usage endpoint via a personal access token stored in Windows Credential Manager.
+- Copilot usage: GitHub Copilot usage endpoint via a personal access token stored in Windows Credential Manager, with local Copilot OTEL logs for cost estimates.
+- Cursor usage: cursor.com usage endpoints via the local Cursor session token (auto-detected) or a manually pasted browser cookie.
 - Token + cost estimates: local JSONL logs from `~/.codex/sessions` and `~/.claude/projects`.
 
-## Security & privacy
-- Reads local auth and log files on your machine.
-- Sends requests only to provider APIs to fetch usage data; no third-party telemetry.
+## Insights Card CLI
+Generate a shareable Claude Code Insights card from your Claude Code usage report:
 
-## Performance
-- Background polling at a fixed interval (default 5 minutes).
-- Single-instance, tray-first UI designed to stay lightweight.
+```powershell
+npx costats ccinsights
+```
+
+See [docs/INSIGHTS.md](docs/INSIGHTS.md) for defaults, flags, and requirements.
 
 ## Build
 Requires a .NET SDK that supports `net10.0-windows`.
