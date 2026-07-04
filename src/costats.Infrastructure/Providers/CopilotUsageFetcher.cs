@@ -115,7 +115,7 @@ public sealed class CopilotUsageFetcher : IDisposable
         return CopilotUsageFetchResult.Failed("Copilot usage request failed.");
     }
 
-    internal static CopilotUsagePayload? ParsePayload(string json)
+    public static CopilotUsagePayload? ParsePayload(string json)
     {
         try
         {
@@ -136,16 +136,13 @@ public sealed class CopilotUsageFetcher : IDisposable
             }
 
             // Free plan: limited_user_quotas (remaining) + monthly_quotas (total)
-            if (premium is null && chat is null)
-            {
-                var hasLimited = root.TryGetProperty("limited_user_quotas", out var limited) && limited.ValueKind == JsonValueKind.Object;
-                var hasMonthly = root.TryGetProperty("monthly_quotas", out var monthly) && monthly.ValueKind == JsonValueKind.Object;
+            var hasLimited = root.TryGetProperty("limited_user_quotas", out var limited) && limited.ValueKind == JsonValueKind.Object;
+            var hasMonthly = root.TryGetProperty("monthly_quotas", out var monthly) && monthly.ValueKind == JsonValueKind.Object;
 
-                if (hasLimited && hasMonthly)
-                {
-                    chat = BuildFreeQuota(limited, monthly, "chat");
-                    completions = BuildFreeQuota(limited, monthly, "completions");
-                }
+            if (hasLimited && hasMonthly)
+            {
+                chat ??= BuildFreeQuota(limited, monthly, "chat");
+                completions ??= BuildFreeQuota(limited, monthly, "completions");
             }
 
             // Prefer quota_reset_date_utc (full ISO 8601) over quota_reset_date / limited_user_reset_date
@@ -201,15 +198,20 @@ public sealed class CopilotUsageFetcher : IDisposable
         var entitlement = ReadLong(element, "entitlement");
         var remaining = ReadLong(element, "remaining");
         var percentRemaining = ReadDouble(element, "percent_remaining");
-        var unlimited = ReadBool(element, "unlimited");
+        var unlimited = ReadBool(element, "unlimited") ?? false;
         var overagePermitted = ReadBool(element, "overage_permitted");
         var overageCount = ReadLong(element, "overage_count");
+
+        if (!unlimited && (entitlement is null || remaining is null))
+        {
+            return null;
+        }
 
         return new CopilotQuotaSnapshot(
             Entitlement: entitlement ?? 0,
             Remaining: remaining ?? 0,
             PercentRemaining: percentRemaining,
-            Unlimited: unlimited ?? false,
+            Unlimited: unlimited,
             OveragePermitted: overagePermitted ?? false,
             OverageCount: overageCount ?? 0);
     }
