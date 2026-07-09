@@ -1,0 +1,70 @@
+{
+  "totalUsageEventsCount": 34,
+  "usageEventsDisplay": [
+    {
+      "timestamp": "1783635383682",
+      "model": "gpt-5.6-sol-high",
+      "kind": "USAGE_EVENT_KIND_INCLUDED_IN_PRO",
+      "requestsCosts": 61.79999923706055,
+      "usageBasedCosts": "-",
+      "isTokenBasedCall": true,
+      "tokenUsage": {
+        "inputTokens": 124067,
+        "outputTokens": 17787,
+        "cacheReadTokens": 2636480,
+        "totalCents": 247.218505859375
+      },
+      "owningUser": "10000001",
+      "cursorTokenFee": 0,
+      "isChargeable": true,
+      "serviceAccountId": "null",
+      "isHeadless": false,
+      "chargedCents": 247.218505859375,
+      "conversationId": "00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "timestamp": "1783635209285",
+      "model": "claude-4.5-sonnet",
+      "kind": "USAGE_EVENT_KIND_INCLUDED_IN_PRO",
+      "requestsCosts": 15.699999809265137,
+      "usageBasedCosts": "-",
+      "isTokenBasedCall": true,
+      "tokenUsage": {
+        "inputTokens": "5000",
+        "outputTokens": "900",
+        "cacheReadTokens": "42000",
+        "cacheWriteTokens": "1200",
+        "totalCents": "18.5"
+      },
+      "owningUser": "10000001",
+      "cursorTokenFee": 0,
+      "isChargeable": true,
+      "serviceAccountId": "null",
+      "isHeadless": false,
+      "chargedCents": 18.5,
+      "conversationId": "00000000-0000-0000-0000-000000000002"
+    },
+    {
+      "timestamp": "1783544115930",
+      "model": "composer-2.5-fast",
+      "kind": "USAGE_EVENT_KIND_INCLUDED_IN_PRO",
+      "requestsCosts": 3.9000000953674316,
+      "usageBasedCosts": "-",
+      "isTokenBasedCall": true,
+      "tokenUsage": {
+        "inputTokens": 537,
+        "outputTokens": 99,
+        "cacheReadTokens": 153344,
+        "totalCents": 15.727399826049805,
+        "discountPercentOff": 50
+      },
+      "owningUser": "10000001",
+      "cursorTokenFee": 0,
+      "isChargeable": true,
+      "serviceAccountId": "null",
+      "isHeadless": false,
+      "chargedCents": 7.863699913024902,
+      "conversationId": "00000000-0000-0000-0000-000000000003"
+    }
+  ]
+}

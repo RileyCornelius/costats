@@ -57,8 +57,12 @@ By default it reads `~/.claude/usage-data/report.html` and writes the PNG to `~/
 
 ## Requirements
 - Node.js `>=18`
-- Claude Code signed in (uses `~/.claude/.credentials.json`)
+- Claude Code signed in (uses CLI-managed `~/.claude/.credentials.json`)
 - A Claude Code insights report (run `/insights` in Claude Code first)
+
+If the Claude Code login has expired, run `claude auth login` in PowerShell and
+complete the browser sign-in before running the Insights CLI again. The tool
+does not store or refresh your OAuth refresh token.
 
 ## How it works
 1. Reads your Claude Code insights HTML report.

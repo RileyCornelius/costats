@@ -30,13 +30,13 @@ public sealed class ClaudeIdentityTests
     [InlineData(ClaudeAuthStatus.Unauthorized)]
     public void SignInMessage_PromptsLogin_WhenTokenDead(ClaudeAuthStatus status)
     {
-        Assert.Equal("Sign-in expired — run claude /login", ClaudeIdentity.SignInMessage(status));
+        Assert.Equal("Sign-in expired — run claude auth login", ClaudeIdentity.SignInMessage(status));
     }
 
     [Fact]
     public void SignInMessage_PromptsLogin_WhenNoCredentials()
     {
-        Assert.Equal("Not signed in — run claude /login", ClaudeIdentity.SignInMessage(ClaudeAuthStatus.NoCredentials));
+        Assert.Equal("Not signed in — run claude auth login", ClaudeIdentity.SignInMessage(ClaudeAuthStatus.NoCredentials));
     }
 
     [Theory]

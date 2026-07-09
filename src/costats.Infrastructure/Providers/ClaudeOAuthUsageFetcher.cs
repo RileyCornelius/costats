@@ -170,9 +170,9 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     }
 
     /// <summary>
-    /// Runs <c>claude /status</c> which internally triggers Claude Code's
-    /// OAuth token refresh.  After the command returns the credentials file
-    /// is expected to contain a fresh token.
+    /// Runs <c>claude auth status</c>, the CLI's non-interactive authentication
+    /// command. Costats never handles the OAuth refresh token; after the CLI
+    /// exits, it reloads the CLI-managed credential store.
     /// </summary>
     private async Task TryDelegatedRefreshAsync(CancellationToken cancellationToken)
     {
@@ -194,7 +194,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
             process.StartInfo = new ProcessStartInfo
             {
                 FileName = claudePath,
-                Arguments = "/status",
+                Arguments = "auth status",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,

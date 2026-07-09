@@ -27,6 +27,7 @@
   <ItemGroup>
     <None Include="Fixtures\usage-records.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Fixtures\cursor-usage-summary.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Fixtures\cursor-usage-events.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

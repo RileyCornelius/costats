@@ -31,9 +31,9 @@ public static class ClaudeIdentity
     public static string SignInMessage(ClaudeAuthStatus status) => status switch
     {
         ClaudeAuthStatus.Expired or ClaudeAuthStatus.Unauthorized
-            => "Sign-in expired — run claude /login",
+            => "Sign-in expired — run claude auth login",
         ClaudeAuthStatus.NoCredentials
-            => "Not signed in — run claude /login",
+            => "Not signed in — run claude auth login",
         _ => string.Empty
     };
 

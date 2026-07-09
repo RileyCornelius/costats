@@ -68,21 +68,77 @@ Credential Vault (`cursor.token`) and validated against the API on save.
 
   `used`/`limit`/`remaining` are **cents**; the `*PercentUsed` fields are already 0–100
   percentages. `plan.limit` is often just the subscription price in cents, so `used/limit`
-  can diverge from the dashboard bars — `totalPercentUsed` is authoritative.
+  can diverge from the dashboard bars. `autoPercentUsed` is the dashboard's
+  **First-party models** bar, `apiPercentUsed` its **API** bar, and `totalPercentUsed` a
+  weighted blend of the two (not an average — e.g. auto 2% + api 12% has been observed as
+  total 4%).
+- `POST https://cursor.com/api/dashboard/get-filtered-usage-events` — per-request usage
+  events, used to estimate token cost. Requires the same session cookie plus an `Origin:
+  https://cursor.com` header. Request body (all dates epoch **milliseconds as strings**):
+
+  ```json
+  { "teamId": 0, "startDate": "1751000000000", "endDate": "1753600000000", "page": 1, "pageSize": 100 }
+  ```
+
+  Verified response shape (2026-07):
+
+  ```json
+  {
+    "totalUsageEventsCount": 34,
+    "usageEventsDisplay": [
+      {
+        "timestamp": "1783635383682",
+        "model": "gpt-5.6-sol-high",
+        "kind": "USAGE_EVENT_KIND_INCLUDED_IN_PRO",
+        "isTokenBasedCall": true,
+        "tokenUsage": {
+          "inputTokens": 124067, "outputTokens": 17787, "cacheReadTokens": 2636480,
+          "totalCents": 247.2185
+        },
+        "chargedCents": 247.2185
+      }
+    ]
+  }
+  ```
+
+  `timestamp` is epoch ms as a string. `tokenUsage.cacheWriteTokens` appears for models
+  with cache-write billing. `tokenUsage.totalCents` is Cursor's own pre-discount API-value
+  estimate for the call; `chargedCents` is after discounts (`discountPercentOff`). The
+  fetcher paginates until `totalUsageEventsCount` is reached (page size 100, hard cap 50
+  pages) and tolerates numeric fields encoded as strings.
 - `GET https://cursor.com/api/auth/me` — email/name. **Best-effort only**: observed to return
   404 ("User not found") for some account types even when `usage-summary` succeeds, so
   identity primarily comes from the `cursorAuth/cachedEmail` DB key.
-- HTTP 401/403 from either endpoint means the session is invalid/expired.
+- HTTP 401/403 from any endpoint means the session is invalid/expired.
 
 ## Field → widget mapping
 
-- Primary bar (session slot): `individualUsage.plan.totalPercentUsed`, rendered as
-  `SessionUsed`/`SessionLimit = 100`. Fallbacks when absent: average of
-  `autoPercentUsed`/`apiPercentUsed`, then `used/limit`.
-- Secondary bar (week slot): on-demand spend, `onDemand.used`/`onDemand.limit` in cents —
-  only shown when a spending limit is configured (`limit > 0`).
-- Reset window: `billingCycleEnd` (monthly billing cycle).
+- **First-party models** bar (session slot): `individualUsage.plan.autoPercentUsed`,
+  rendered as `SessionUsed`/`SessionLimit = 100`. Fallbacks when absent (payload shape
+  varies by account type): `totalPercentUsed`, then `used/limit`.
+- **API** bar (week slot): `individualUsage.plan.apiPercentUsed`, rendered the same way.
+  No fallback — the bar is hidden when the field is absent.
+- On-demand spend (`onDemand.used`/`limit`) is still parsed but no longer displayed; the
+  two visible bars mirror the dashboard's First-party models / API split.
+- Reset window: `billingCycleEnd` (monthly billing cycle) for both bars.
 - Plan label: `membershipType` ("pro" → "Pro").
+
+## Estimated cost (Cost section)
+
+The Cost section shows Today / Last 30 days token counts and estimated cost, built from
+`get-filtered-usage-events` the same way Codex and Claude costs are built from local logs:
+
+- Events are aggregated per local day and model; `tokenUsage` maps input, cache-read,
+  cache-write, and output tokens into the shared `TokenLedger`.
+- Models with a pricing-catalog entry (OpenAI/Anthropic ids the model matcher can resolve)
+  are priced at **provider list rates**, matching Codex/Claude semantics.
+- Cursor-proprietary models (`composer-*`, mode-suffixed ids like `gpt-5.6-sol-high` when
+  unmatched) fall back to Cursor's own `tokenUsage.totalCents` estimate instead of
+  contributing $0. Events with no tokens are skipped.
+- The paginated events call is heavier than `usage-summary`, so the digest is cached for
+  30 minutes (`CursorUsageSource.ConsumptionCacheTtl`); quota bars keep refreshing at the
+  normal cadence, and a failed events fetch falls back to the last good digest. Costs are
+  **estimates of API value**, not what Cursor bills the subscription.
 
 ## Troubleshooting
 

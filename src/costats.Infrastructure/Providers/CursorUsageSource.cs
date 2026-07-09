@@ -2,6 +2,7 @@ using costats.Application.Pulse;
 using costats.Application.Security;
 using costats.Application.Settings;
 using costats.Core.Pulse;
+using costats.Infrastructure.Expense;
 using costats.Infrastructure.Providers.Cursor;
 using Microsoft.Extensions.Logging;
 using static costats.Core.Pulse.UsageFormatter;
@@ -11,24 +12,36 @@ namespace costats.Infrastructure.Providers;
 public sealed class CursorUsageSource : ISignalSource
 {
     private const string SignedOutSummary = "Cursor session expired — open Cursor or paste a token in Settings";
+    private const int ConsumptionWindowDays = 30;
+
+    // The paginated events call is much heavier than usage-summary, so the digest is
+    // recomputed at most this often while the summary follows the normal refresh cadence.
+    private static readonly TimeSpan ConsumptionCacheTtl = TimeSpan.FromMinutes(30);
 
     private readonly AppSettings _settings;
     private readonly ICredentialVault _credentialVault;
     private readonly CursorCredentialReader _credentialReader;
     private readonly CursorUsageFetcher _fetcher;
+    private readonly ExpenseAnalyzer _expenseAnalyzer;
     private readonly ILogger<CursorUsageSource> _logger;
+
+    private readonly object _consumptionGate = new();
+    private ConsumptionDigest? _cachedConsumption;
+    private DateTimeOffset _consumptionComputedAt = DateTimeOffset.MinValue;
 
     public CursorUsageSource(
         AppSettings settings,
         ICredentialVault credentialVault,
         CursorCredentialReader credentialReader,
         CursorUsageFetcher fetcher,
+        ExpenseAnalyzer expenseAnalyzer,
         ILogger<CursorUsageSource> logger)
     {
         _settings = settings;
         _credentialVault = credentialVault;
         _credentialReader = credentialReader;
         _fetcher = fetcher;
+        _expenseAnalyzer = expenseAnalyzer;
         _logger = logger;
     }
 
@@ -54,9 +67,11 @@ public sealed class CursorUsageSource : ISignalSource
             var localCredentials = _credentialReader.ReadLocalCredentials();
 
             CursorUsageFetchResult? result = null;
+            string? activeCookie = null;
             if (localCredentials is not null)
             {
-                result = await _fetcher.FetchAsync(localCredentials.CookieHeader, cancellationToken).ConfigureAwait(false);
+                activeCookie = localCredentials.CookieHeader;
+                result = await _fetcher.FetchAsync(activeCookie, cancellationToken).ConfigureAwait(false);
             }
 
             // Fall back to the manually pasted token when the local install has no usable session.
@@ -66,6 +81,7 @@ public sealed class CursorUsageSource : ISignalSource
                 var manualCookie = CursorCredentialReader.NormalizeManualToken(manualToken);
                 if (manualCookie is not null)
                 {
+                    activeCookie = manualCookie;
                     result = await _fetcher.FetchAsync(manualCookie, cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -106,24 +122,27 @@ public sealed class CursorUsageSource : ISignalSource
 
             var payload = result.Payload;
 
+            // Session slot carries the dashboard's "First-party models" bar and the week
+            // slot its "API" bar, both as 0-100 percentages of the included plan.
             long? sessionUsed = null;
             long? sessionLimit = null;
-            if (payload.PlanPercentUsed is not null)
+            if (payload.FirstPartyPercentUsed is not null)
             {
-                sessionUsed = (long)Math.Round(payload.PlanPercentUsed.Value);
+                sessionUsed = (long)Math.Round(payload.FirstPartyPercentUsed.Value);
                 sessionLimit = 100;
             }
 
-            // On-demand usage is only meaningful when a spending limit is configured.
             long? weekUsed = null;
             long? weekLimit = null;
-            if (payload.OnDemandLimitCents is > 0)
+            if (payload.ApiPercentUsed is not null)
             {
-                weekUsed = payload.OnDemandUsedCents ?? 0;
-                weekLimit = payload.OnDemandLimitCents;
+                weekUsed = (long)Math.Round(payload.ApiPercentUsed.Value);
+                weekLimit = 100;
             }
 
-            if (sessionUsed is null && weekUsed is null)
+            var consumption = await GetConsumptionAsync(activeCookie!, cancellationToken).ConfigureAwait(false);
+
+            if (sessionUsed is null && weekUsed is null && consumption is null)
             {
                 return new ProviderReading(
                     Usage: null,
@@ -152,7 +171,7 @@ public sealed class CursorUsageSource : ISignalSource
                 WeekUsed: weekUsed,
                 WeekLimit: weekLimit,
                 SpendingBucket: null,
-                Consumption: null,
+                Consumption: consumption,
                 SessionWindow: sessionWindow,
                 WeekWindow: weekWindow);
 
@@ -180,6 +199,56 @@ public sealed class CursorUsageSource : ISignalSource
                 CapturedAt: now,
                 Confidence: ReadingConfidence.Low,
                 Source: ReadingSource.Api);
+        }
+    }
+
+    /// <summary>
+    /// Returns the token-consumption digest built from dashboard usage events, recomputing
+    /// at most every <see cref="ConsumptionCacheTtl"/>. Failures fall back to the last good
+    /// digest (or null on the first run) so cost display degrades without affecting quota data.
+    /// </summary>
+    private async Task<ConsumptionDigest?> GetConsumptionAsync(string cookieHeader, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_consumptionGate)
+        {
+            if (_cachedConsumption is not null && now - _consumptionComputedAt < ConsumptionCacheTtl)
+            {
+                return _cachedConsumption;
+            }
+        }
+
+        try
+        {
+            var eventsResult = await _fetcher.FetchUsageEventsAsync(
+                cookieHeader,
+                now.AddDays(-ConsumptionWindowDays),
+                now,
+                cancellationToken).ConfigureAwait(false);
+
+            if (eventsResult.Status != CursorFetchStatus.Success)
+            {
+                _logger.LogDebug("Cursor usage events fetch skipped: {Summary}", eventsResult.StatusSummary);
+                return _cachedConsumption;
+            }
+
+            var digest = await _expenseAnalyzer.AnalyzeCursorAsync(eventsResult.Events, cancellationToken).ConfigureAwait(false);
+            lock (_consumptionGate)
+            {
+                _cachedConsumption = digest;
+                _consumptionComputedAt = now;
+            }
+
+            return digest;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Cursor consumption digest failed");
+            return _cachedConsumption;
         }
     }
 

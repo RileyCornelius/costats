@@ -368,7 +368,7 @@
                                         <Setter Property="Text" Value="Premium requests" />
                                     </DataTrigger>
                                     <DataTrigger Binding="{Binding ProviderId}" Value="cursor">
-                                        <Setter Property="Text" Value="Plan usage" />
+                                        <Setter Property="Text" Value="First party models" />
                                     </DataTrigger>
                                 </Style.Triggers>
                             </Style>
@@ -392,7 +392,7 @@
                                         <Setter Property="Text" Value="Chat requests" />
                                     </DataTrigger>
                                     <DataTrigger Binding="{Binding ProviderId}" Value="cursor">
-                                        <Setter Property="Text" Value="On-demand spend" />
+                                        <Setter Property="Text" Value="API" />
                                     </DataTrigger>
                                 </Style.Triggers>
                             </Style>
@@ -485,9 +485,6 @@
                             <Setter Property="Visibility" Value="Visible" />
                             <Style.Triggers>
                                 <DataTrigger Binding="{Binding ProviderId}" Value="copilot">
-                                    <Setter Property="Visibility" Value="Collapsed" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding ProviderId}" Value="cursor">
                                     <Setter Property="Visibility" Value="Collapsed" />
                                 </DataTrigger>
                             </Style.Triggers>

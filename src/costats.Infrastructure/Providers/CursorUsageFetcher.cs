@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
@@ -9,7 +10,10 @@ public sealed class CursorUsageFetcher : IDisposable
     private const string BaseUrl = "https://cursor.com/";
     private const string UsageSummaryPath = "api/usage-summary";
     private const string AuthMePath = "api/auth/me";
+    private const string UsageEventsPath = "api/dashboard/get-filtered-usage-events";
     private const string UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) costats";
+    private const int EventsPageSize = 100;
+    private const int EventsMaxPages = 50;
     private static readonly TimeSpan[] RetryDelays =
     [
         TimeSpan.FromMilliseconds(250),
@@ -19,14 +23,12 @@ public sealed class CursorUsageFetcher : IDisposable
     private readonly HttpClient _httpClient;
     private readonly ILogger<CursorUsageFetcher> _logger;
 
-    public CursorUsageFetcher(ILogger<CursorUsageFetcher> logger)
+    public CursorUsageFetcher(ILogger<CursorUsageFetcher> logger, HttpMessageHandler? httpMessageHandler = null)
     {
         _logger = logger;
-        _httpClient = new HttpClient
-        {
-            BaseAddress = new Uri(BaseUrl),
-            Timeout = TimeSpan.FromSeconds(10)
-        };
+        _httpClient = httpMessageHandler is null ? new HttpClient() : new HttpClient(httpMessageHandler);
+        _httpClient.BaseAddress = new Uri(BaseUrl);
+        _httpClient.Timeout = TimeSpan.FromSeconds(10);
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
         _httpClient.DefaultRequestHeaders.Accept.ParseAdd("application/json");
     }
@@ -151,35 +153,28 @@ public sealed class CursorUsageFetcher : IDisposable
                 hasOnDemand = individual.TryGetProperty("onDemand", out onDemand) && onDemand.ValueKind == JsonValueKind.Object;
             }
 
-            double? planPercentUsed = null;
+            double? firstPartyPercentUsed = null;
+            double? apiPercentUsed = null;
             if (hasPlan)
             {
-                // Prefer totalPercentUsed: plan.limit is often the subscription price in cents,
-                // so used/limit can diverge from the dashboard usage bars.
-                var totalPercent = ReadDouble(plan, "totalPercentUsed");
+                // autoPercentUsed is the dashboard's "First-party models" bar and apiPercentUsed
+                // its "API" bar. The payload shape varies by account type, so the first-party bar
+                // falls back to the blended totalPercentUsed, then used/limit (plan.limit is often
+                // the subscription price in cents, so used/limit can diverge from the dashboard).
                 var autoPercent = ReadDouble(plan, "autoPercentUsed");
+                var totalPercent = ReadDouble(plan, "totalPercentUsed");
                 var apiPercent = ReadDouble(plan, "apiPercentUsed");
                 var used = ReadLong(plan, "used");
                 var limit = ReadLong(plan, "limit");
 
-                if (totalPercent is not null)
+                firstPartyPercentUsed = autoPercent ?? totalPercent;
+                if (firstPartyPercentUsed is null && used is not null && limit is > 0)
                 {
-                    planPercentUsed = totalPercent;
-                }
-                else if (autoPercent is not null && apiPercent is not null)
-                {
-                    planPercentUsed = (autoPercent + apiPercent) / 2.0;
-                }
-                else if (apiPercent is not null || autoPercent is not null)
-                {
-                    planPercentUsed = apiPercent ?? autoPercent;
-                }
-                else if (used is not null && limit is > 0)
-                {
-                    planPercentUsed = (double)used.Value / limit.Value * 100.0;
+                    firstPartyPercentUsed = (double)used.Value / limit.Value * 100.0;
                 }
 
-                planPercentUsed = planPercentUsed is null ? null : Math.Clamp(planPercentUsed.Value, 0.0, 100.0);
+                firstPartyPercentUsed = ClampPercent(firstPartyPercentUsed);
+                apiPercentUsed = ClampPercent(apiPercent);
             }
 
             long? onDemandUsedCents = null;
@@ -191,7 +186,8 @@ public sealed class CursorUsageFetcher : IDisposable
             }
 
             return new CursorUsagePayload(
-                PlanPercentUsed: planPercentUsed,
+                FirstPartyPercentUsed: firstPartyPercentUsed,
+                ApiPercentUsed: apiPercentUsed,
                 OnDemandUsedCents: onDemandUsedCents,
                 OnDemandLimitCents: onDemandLimitCents,
                 BillingCycleEnd: ReadDateTime(root, "billingCycleEnd"),
@@ -204,6 +200,163 @@ public sealed class CursorUsageFetcher : IDisposable
             return null;
         }
     }
+
+    /// <summary>
+    /// Fetches individual usage events from the dashboard API for the given time range,
+    /// paginating until all events are collected. Unlike the summary endpoint this is a
+    /// heavier call, so callers are expected to cache the result rather than invoke it on
+    /// every refresh.
+    /// </summary>
+    public async Task<CursorUsageEventsResult> FetchUsageEventsAsync(
+        string? cookieHeader,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(cookieHeader))
+        {
+            return CursorUsageEventsResult.MissingToken();
+        }
+
+        var trimmedCookie = cookieHeader.Trim();
+        var events = new List<CursorUsageEvent>();
+        long? totalCount = null;
+
+        try
+        {
+            for (var page = 1; page <= EventsMaxPages; page++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                using var request = new HttpRequestMessage(HttpMethod.Post, UsageEventsPath);
+                request.Headers.Add("Cookie", trimmedCookie);
+                request.Headers.Add("Origin", "https://cursor.com");
+                request.Headers.Add("Referer", "https://cursor.com/dashboard");
+                var body = JsonSerializer.Serialize(new
+                {
+                    teamId = 0,
+                    startDate = start.ToUnixTimeMilliseconds().ToString(),
+                    endDate = end.ToUnixTimeMilliseconds().ToString(),
+                    page,
+                    pageSize = EventsPageSize
+                });
+                request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+                var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                {
+                    return CursorUsageEventsResult.InvalidToken();
+                }
+
+                if ((int)response.StatusCode == 429)
+                {
+                    return CursorUsageEventsResult.RateLimited();
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogWarning("Cursor usage events request failed with status {StatusCode}", response.StatusCode);
+                    return CursorUsageEventsResult.Failed("Cursor usage events request failed.");
+                }
+
+                var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var parsed = ParseUsageEventsPage(content);
+                if (parsed is null)
+                {
+                    return CursorUsageEventsResult.Failed("Cursor usage events response could not be parsed.");
+                }
+
+                totalCount ??= parsed.TotalCount;
+                events.AddRange(parsed.Events);
+
+                if (parsed.Events.Count < EventsPageSize || (totalCount is not null && events.Count >= totalCount))
+                {
+                    break;
+                }
+            }
+
+            return CursorUsageEventsResult.Success(events);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cursor usage events fetch failed");
+            return CursorUsageEventsResult.Failed("Cursor usage events request failed.");
+        }
+    }
+
+    /// <summary>
+    /// Parses one page of an api/dashboard/get-filtered-usage-events response. Verified shape:
+    /// { "totalUsageEventsCount": N, "usageEventsDisplay": [ { "timestamp": "&lt;epoch ms&gt;",
+    /// "model": "...", "tokenUsage": { "inputTokens", "outputTokens", "cacheReadTokens",
+    /// "cacheWriteTokens", "totalCents" } } ] }. Numeric fields tolerate string encoding;
+    /// events without a timestamp are skipped.
+    /// </summary>
+    public static CursorUsageEventsPage? ParseUsageEventsPage(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var totalCount = ReadLong(root, "totalUsageEventsCount");
+
+            if (!root.TryGetProperty("usageEventsDisplay", out var items) || items.ValueKind != JsonValueKind.Array)
+            {
+                if (!root.TryGetProperty("usageEvents", out items) || items.ValueKind != JsonValueKind.Array)
+                {
+                    return new CursorUsageEventsPage(totalCount, []);
+                }
+            }
+
+            var events = new List<CursorUsageEvent>(items.GetArrayLength());
+            foreach (var item in items.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var timestampMs = ReadLong(item, "timestamp");
+                if (timestampMs is null)
+                {
+                    continue;
+                }
+
+                long inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, cacheWriteTokens = 0;
+                double? totalCents = null;
+                if (item.TryGetProperty("tokenUsage", out var tokenUsage) && tokenUsage.ValueKind == JsonValueKind.Object)
+                {
+                    inputTokens = ReadLong(tokenUsage, "inputTokens") ?? 0;
+                    outputTokens = ReadLong(tokenUsage, "outputTokens") ?? 0;
+                    cacheReadTokens = ReadLong(tokenUsage, "cacheReadTokens") ?? 0;
+                    cacheWriteTokens = ReadLong(tokenUsage, "cacheWriteTokens", "cacheCreationTokens") ?? 0;
+                    totalCents = ReadDouble(tokenUsage, "totalCents");
+                }
+
+                events.Add(new CursorUsageEvent(
+                    Timestamp: DateTimeOffset.FromUnixTimeMilliseconds(timestampMs.Value),
+                    Model: ReadString(item, "model") ?? "unknown",
+                    InputTokens: Math.Max(0, inputTokens),
+                    CacheReadTokens: Math.Max(0, cacheReadTokens),
+                    CacheWriteTokens: Math.Max(0, cacheWriteTokens),
+                    OutputTokens: Math.Max(0, outputTokens),
+                    TotalCents: totalCents));
+            }
+
+            return new CursorUsageEventsPage(totalCount, events);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static double? ClampPercent(double? value)
+        => value is null ? null : Math.Clamp(value.Value, 0.0, 100.0);
 
     private static long? ReadLong(JsonElement element, params string[] names)
     {
@@ -295,13 +448,53 @@ public sealed class CursorUsageFetcher : IDisposable
 }
 
 public sealed record CursorUsagePayload(
-    double? PlanPercentUsed,
+    double? FirstPartyPercentUsed,
+    double? ApiPercentUsed,
     long? OnDemandUsedCents,
     long? OnDemandLimitCents,
     DateTimeOffset? BillingCycleEnd,
     string? MembershipType,
     string? Email,
     DateTimeOffset FetchedAt);
+
+/// <summary>
+/// One dashboard usage event. Token counts are raw per-request values; TotalCents is
+/// Cursor's own pre-discount API-value estimate for the call, used as the cost fallback
+/// for models with no pricing-catalog entry.
+/// </summary>
+public sealed record CursorUsageEvent(
+    DateTimeOffset Timestamp,
+    string Model,
+    long InputTokens,
+    long CacheReadTokens,
+    long CacheWriteTokens,
+    long OutputTokens,
+    double? TotalCents);
+
+public sealed record CursorUsageEventsPage(
+    long? TotalCount,
+    IReadOnlyList<CursorUsageEvent> Events);
+
+public sealed record CursorUsageEventsResult(
+    CursorFetchStatus Status,
+    IReadOnlyList<CursorUsageEvent> Events,
+    string StatusSummary)
+{
+    public static CursorUsageEventsResult Success(IReadOnlyList<CursorUsageEvent> events)
+        => new(CursorFetchStatus.Success, events, "Cursor usage events loaded.");
+
+    public static CursorUsageEventsResult MissingToken()
+        => new(CursorFetchStatus.MissingToken, [], "Cursor session not found.");
+
+    public static CursorUsageEventsResult InvalidToken()
+        => new(CursorFetchStatus.InvalidToken, [], "Cursor session rejected.");
+
+    public static CursorUsageEventsResult RateLimited()
+        => new(CursorFetchStatus.RateLimited, [], "Cursor usage events rate limited.");
+
+    public static CursorUsageEventsResult Failed(string message)
+        => new(CursorFetchStatus.Failed, [], message);
+}
 
 public enum CursorFetchStatus
 {
