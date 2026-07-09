@@ -55,6 +55,7 @@ More details in [docs/COPILOT.md](docs/COPILOT.md).
 
 Setup and troubleshooting details in [docs/CURSOR.md](docs/CURSOR.md).
 
+
 ## Data sources
 - Codex usage: OAuth usage endpoint via `~/.codex/auth.json` (or `CODEX_HOME`), with local logs as a fallback for estimates.
 - Claude usage: OAuth usage endpoint via CLI-managed `~/.claude/.credentials.json`, with local logs as a fallback for estimates. Costats delegates credential checks to the installed `claude` CLI and does not persist Anthropic tokens.
