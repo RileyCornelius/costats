@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
-using costats.Core.Pulse;
 
 namespace costats.Infrastructure.Providers;
 
@@ -23,6 +22,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
 
     private static readonly TimeSpan RefreshCooldownSuccess = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan RefreshCooldownFailure = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan RefreshTimeout = TimeSpan.FromSeconds(15);
 
     private readonly HttpClient _httpClient;
     private readonly string? _configDir;
@@ -170,9 +170,10 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     }
 
     /// <summary>
-    /// Runs <c>claude auth status</c>, the CLI's non-interactive authentication
-    /// command. Costats never handles the OAuth refresh token; after the CLI
-    /// exits, it reloads the CLI-managed credential store.
+    /// Starts Claude's normal session initialization and immediately exits. Unlike
+    /// <c>claude auth status</c> (which only reports cached state), session startup
+    /// runs Claude Code's OAuth refresh path. Costats never reads or writes the
+    /// refresh token; after the CLI exits, it reloads the CLI-managed credential store.
     /// </summary>
     private async Task TryDelegatedRefreshAsync(CancellationToken cancellationToken)
     {
@@ -190,40 +191,41 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
                 return;
             }
 
-            using var process = new Process();
-            process.StartInfo = new ProcessStartInfo
+            using var process = new Process
             {
-                FileName = claudePath,
-                Arguments = "auth status",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
+                StartInfo = CreateDelegatedRefreshStartInfo(claudePath, _configDir)
             };
-
-            // Propagate the profile config dir so Claude Code uses the right credentials.
-            if (_configDir is not null)
-            {
-                process.StartInfo.EnvironmentVariables["CLAUDE_CONFIG_DIR"] = _configDir;
-            }
 
             process.Start();
 
-            // Wait up to 5 seconds for the process to complete
+            await process.StandardInput.WriteLineAsync("/exit").ConfigureAwait(false);
+            process.StandardInput.Close();
+
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(5));
+            cts.CancelAfter(RefreshTimeout);
 
             try
             {
                 await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+                _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownSuccess;
             }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
-                // Timed out — kill the process but don't propagate
-                try { process.Kill(); } catch { /* best effort */ }
-            }
+                // Never leave a hidden Claude process behind after a timeout or shutdown.
+                try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
 
-            _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownSuccess;
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+
+                // Timed out — retry soon on the next refresh.
+                _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownFailure;
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -233,6 +235,28 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         {
             _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownFailure;
         }
+    }
+
+    internal static ProcessStartInfo CreateDelegatedRefreshStartInfo(string claudePath, string? configDir)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = claudePath,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        startInfo.ArgumentList.Add("/status");
+
+        // Propagate the profile config dir so Claude Code uses the right credentials.
+        if (configDir is not null)
+        {
+            startInfo.Environment["CLAUDE_CONFIG_DIR"] = configDir;
+        }
+
+        return startInfo;
     }
 
     private static string? FindClaudeCli()
