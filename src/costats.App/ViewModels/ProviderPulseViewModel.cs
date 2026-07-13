@@ -168,6 +168,16 @@ public sealed partial class ProviderPulseViewModel : ObservableObject
             return;
         }
 
+        // No session data or window while weekly data exists means the provider
+        // reports no session limit (e.g. OpenAI temporarily suspending the
+        // 5-hour window) — say so instead of showing an empty 0% bar.
+        if (usage.SessionUsed is null && usage.SessionLimit is null && usage.SessionWindow is null && usage.WeekWindow is not null)
+        {
+            vm.SessionUsageLabel = "No limit";
+            vm.SessionPercentText = "--";
+            return;
+        }
+
         var usedPercent = CalculateUsedPercent(usage.SessionUsed, usage.SessionLimit);
         vm.SessionProgress = usedPercent / 100.0;
         vm.SessionUsageLabel = FormatUsageLabel(usedPercent, usage.SessionUsed);

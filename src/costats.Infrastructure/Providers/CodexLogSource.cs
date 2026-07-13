@@ -47,22 +47,32 @@ public sealed class CodexLogSource : ISignalSource
         }
 
         // Prefer OAuth data for percentages
-        var sessionUsedPercent = oauthResult?.PrimaryUsedPercent;
-        var weeklyUsedPercent = oauthResult?.SecondaryUsedPercent;
+        var sessionUsedPercent = oauthResult?.SessionUsedPercent;
+        var weeklyUsedPercent = oauthResult?.WeeklyUsedPercent;
+
+        // When the API responds but reports no session window, OpenAI has
+        // suspended the session limit — surface that as "no limit" instead of
+        // fabricating a local countdown from log data.
+        var sessionLimitSuspended = oauthResult is not null && sessionUsedPercent is null;
 
         // Get window durations from API or use defaults
-        var sessionDuration = oauthResult?.PrimaryWindowSeconds is not null
-            ? TimeSpan.FromSeconds(oauthResult.PrimaryWindowSeconds.Value)
+        var sessionDuration = oauthResult?.SessionWindowSeconds is not null
+            ? TimeSpan.FromSeconds(oauthResult.SessionWindowSeconds.Value)
             : DefaultSessionDuration;
 
-        var weekDuration = oauthResult?.SecondaryWindowSeconds is not null
-            ? TimeSpan.FromSeconds(oauthResult.SecondaryWindowSeconds.Value)
+        var weekDuration = oauthResult?.WeeklyWindowSeconds is not null
+            ? TimeSpan.FromSeconds(oauthResult.WeeklyWindowSeconds.Value)
             : DefaultWeekDuration;
 
-        var sessionResetsAt = oauthResult?.PrimaryResetsAt ?? CalculateSessionReset(logResult.SessionStart, now, sessionDuration);
-        var weeklyResetsAt = oauthResult?.SecondaryResetsAt ?? CalculateWeeklyReset(now);
+        var weeklyResetsAt = oauthResult?.WeeklyResetsAt ?? CalculateWeeklyReset(now);
 
-        var sessionWindow = new QuotaWindow(sessionDuration, sessionResetsAt);
+        QuotaWindow? sessionWindow = null;
+        if (!sessionLimitSuspended)
+        {
+            var sessionResetsAt = oauthResult?.SessionResetsAt ?? CalculateSessionReset(logResult.SessionStart, now, sessionDuration);
+            sessionWindow = new QuotaWindow(sessionDuration, sessionResetsAt);
+        }
+
         var weekWindow = new QuotaWindow(weekDuration, weeklyResetsAt);
 
         // Use percentage data directly when available
@@ -79,7 +89,7 @@ public sealed class CodexLogSource : ISignalSource
         }
         else
         {
-            sessionUsed = logResult.SessionTokens > 0 ? logResult.SessionTokens : null;
+            sessionUsed = !sessionLimitSuspended && logResult.SessionTokens > 0 ? logResult.SessionTokens : null;
             sessionLimit = null;
         }
 
