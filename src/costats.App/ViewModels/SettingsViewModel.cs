@@ -81,6 +81,12 @@ public sealed partial class SettingsViewModel : ObservableObject
     private string updateStatusText = string.Empty;
 
     [ObservableProperty]
+    private string updateButtonText = "Check for updates";
+
+    // Set once a check has found and staged an update; the next button press installs it.
+    private bool _hasStagedUpdate;
+
+    [ObservableProperty]
     private bool multiccDetected;
 
     [ObservableProperty]
@@ -357,6 +363,13 @@ public sealed partial class SettingsViewModel : ObservableObject
         _updateCheckCts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
         var ct = _updateCheckCts.Token;
 
+        // Second press: an update was already found — install it now.
+        if (_hasStagedUpdate)
+        {
+            await InstallStagedUpdateAsync(ct);
+            return;
+        }
+
         IsCheckingForUpdates = true;
         UpdateStatusText = "Checking for updates...";
 
@@ -368,18 +381,13 @@ public sealed partial class SettingsViewModel : ObservableObject
             {
                 case UpdateCheckResult.UpdateStaged:
                 case UpdateCheckResult.UpdateAlreadyStaged:
-                    UpdateStatusText = "Update found. Restarting...";
-                    if (await Task.Run(() => _updateCoordinator.TryApplyPendingUpdateAsync(ct, manualTrigger: true), ct))
-                    {
-                        // Use BeginInvoke to avoid any potential deadlock with synchronous Invoke
-                        _ = System.Windows.Application.Current.Dispatcher.BeginInvoke(() =>
-                            System.Windows.Application.Current.Shutdown(0));
-                    }
-                    else
-                    {
-                        UpdateStatusText = "Update staged. Restart to apply.";
-                        IsCheckingForUpdates = false;
-                    }
+                    var pendingVersion = await _updateCoordinator.GetPendingUpdateVersionAsync(ct);
+                    _hasStagedUpdate = true;
+                    UpdateButtonText = "Install update";
+                    UpdateStatusText = pendingVersion is not null
+                        ? $"Update v{pendingVersion} is available."
+                        : "An update is available.";
+                    IsCheckingForUpdates = false;
                     break;
 
                 case UpdateCheckResult.UpToDate:
@@ -413,6 +421,42 @@ public sealed partial class SettingsViewModel : ObservableObject
         catch
         {
             UpdateStatusText = "Could not check for updates.";
+            IsCheckingForUpdates = false;
+        }
+    }
+
+    private async Task InstallStagedUpdateAsync(CancellationToken ct)
+    {
+        IsCheckingForUpdates = true;
+        UpdateStatusText = "Installing update. Restarting...";
+
+        try
+        {
+            if (await Task.Run(() => _updateCoordinator!.TryApplyPendingUpdateAsync(ct, manualTrigger: true), ct))
+            {
+                // Use BeginInvoke to avoid any potential deadlock with synchronous Invoke
+                _ = System.Windows.Application.Current.Dispatcher.BeginInvoke(() =>
+                    System.Windows.Application.Current.Shutdown(0));
+                return;
+            }
+
+            // The staged update could not be launched (e.g. files were cleaned up).
+            // Fall back to check mode so the next press re-checks.
+            _hasStagedUpdate = false;
+            UpdateButtonText = "Check for updates";
+            UpdateStatusText = "Could not install the update. Try checking again.";
+            IsCheckingForUpdates = false;
+        }
+        catch (OperationCanceledException)
+        {
+            UpdateStatusText = "Update install timed out. Try again.";
+            IsCheckingForUpdates = false;
+        }
+        catch
+        {
+            _hasStagedUpdate = false;
+            UpdateButtonText = "Check for updates";
+            UpdateStatusText = "Could not install the update. Try checking again.";
             IsCheckingForUpdates = false;
         }
     }

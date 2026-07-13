@@ -179,6 +179,16 @@ public sealed class StartupUpdateCoordinator
         }
     }
 
+    /// <summary>
+    /// Returns the version string of a valid staged update that is newer than the
+    /// running version, or null when nothing is staged.
+    /// </summary>
+    public async Task<string?> GetPendingUpdateVersionAsync(CancellationToken cancellationToken)
+    {
+        var pending = await ReadJsonAsync<PendingUpdate>(_pendingPath, cancellationToken).ConfigureAwait(false);
+        return pending is not null && IsPendingValidAndNewer(pending) ? pending.Version : null;
+    }
+
     public async Task<UpdateCheckResult> CheckAndStageUpdateAsync(CancellationToken cancellationToken, bool forceCheck = false)
     {
         if (!_options.Enabled || !CanSelfUpdate())
