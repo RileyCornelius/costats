@@ -1,4 +1,4 @@
-using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -20,12 +20,19 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     private static readonly TimeSpan MaxCacheAge = TimeSpan.FromHours(6);
     private static readonly TimeSpan MemoryCacheTtl = TimeSpan.FromMinutes(30);
 
-    private static readonly TimeSpan RefreshCooldownSuccess = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan RefreshCooldownFailure = TimeSpan.FromSeconds(20);
-    private static readonly TimeSpan RefreshTimeout = TimeSpan.FromSeconds(15);
+    // Match Claude Code's own five-minute early-refresh window. This keeps Costats
+    // from being the process that discovers an expired access token after a day idle.
+    private static readonly TimeSpan ProactiveRefreshWindow = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan RefreshFailureCooldown = TimeSpan.FromSeconds(20);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> RefreshGates = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly HttpClient _httpClient;
+    private readonly bool _disposeHttpClient;
+    private readonly bool _useDiskCache;
     private readonly string? _configDir;
+    private readonly IClaudeCredentialStore _credentialStore;
+    private readonly IClaudeTokenRefresher _tokenRefresher;
+    private readonly TimeProvider _timeProvider;
 
     private int _consecutiveFailures;
     private DateTimeOffset _blockedUntil = DateTimeOffset.MinValue;
@@ -34,8 +41,14 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     private DateTimeOffset _memoryCacheWrittenAt = DateTimeOffset.MinValue;
     private DateTimeOffset _refreshBlockedUntil = DateTimeOffset.MinValue;
 
-    public ClaudeOAuthUsageFetcher()
+    public ClaudeOAuthUsageFetcher() : this(configDir: null)
     {
+    }
+
+    public ClaudeOAuthUsageFetcher(string? configDir)
+    {
+        configDir = ClaudeCredentialStore.ResolveConfigDir(configDir);
+        _configDir = configDir;
         _httpClient = new HttpClient
         {
             BaseAddress = new Uri(BaseUrl),
@@ -44,83 +57,101 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         _httpClient.DefaultRequestHeaders.Add("anthropic-beta", BetaHeader);
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "claude-code/2.1.70");
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        _disposeHttpClient = true;
+        _useDiskCache = true;
+        _credentialStore = new ClaudeCredentialStore(configDir);
+        _tokenRefresher = new ClaudeCliTokenRefresher(configDir);
+        _timeProvider = TimeProvider.System;
     }
 
-    public ClaudeOAuthUsageFetcher(string configDir) : this()
+    internal ClaudeOAuthUsageFetcher(
+        HttpClient httpClient,
+        IClaudeCredentialStore credentialStore,
+        IClaudeTokenRefresher tokenRefresher,
+        TimeProvider? timeProvider = null)
     {
-        _configDir = configDir;
+        _httpClient = httpClient;
+        _configDir = null;
+        _useDiskCache = false;
+        _credentialStore = credentialStore;
+        _tokenRefresher = tokenRefresher;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     //  Public API
     public async Task<ClaudeOAuthOutcome> FetchAsync(CancellationToken cancellationToken)
     {
-        // 1. Load credentials & detect changes
-        var credentials = await LoadCredentialsAsync(_configDir);
-        var fingerprint = ComputeFingerprint(credentials);
+        var credentials = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        ObserveCredentialChange(credentials);
 
-        if (fingerprint != _lastCredentialFingerprint)
+        var subType = credentials?.SubscriptionType;
+        var tier = credentials?.RateLimitTier;
+        var hadRefreshToken = HasUsableRefreshToken(credentials);
+
+        // Refresh a missing access token when a recoverable refresh credential remains,
+        // and refresh five minutes early to avoid the normal one-day expiry gap.
+        if (credentials is not null
+            && HasUsableRefreshToken(credentials)
+            && (credentials.AccessToken is null || IsNearExpiry(credentials)))
         {
-            _lastCredentialFingerprint = fingerprint;
-            _consecutiveFailures = 0;
-            _blockedUntil = DateTimeOffset.MinValue;
-        }
-
-        // No usable credentials at all — surface a sign-in prompt (with any cached usage).
-        if (credentials?.AccessToken is null)
-        {
-            return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.NoCredentials, null, null);
-        }
-
-        // Plan/tier come from the credentials file, so they survive every fetch failure.
-        var subType = credentials.SubscriptionType;
-        var tier = credentials.RateLimitTier;
-
-        // 2. If token is expired, try delegated refresh via Claude CLI
-        if (IsTokenExpired(credentials))
-        {
-            await TryDelegatedRefreshAsync(cancellationToken).ConfigureAwait(false);
-            credentials = await LoadCredentialsAsync(_configDir);
-
-            var newFingerprint = ComputeFingerprint(credentials);
-            if (newFingerprint != _lastCredentialFingerprint)
-            {
-                _lastCredentialFingerprint = newFingerprint;
-                _consecutiveFailures = 0;
-                _blockedUntil = DateTimeOffset.MinValue;
-            }
-
-            // A refresh rewrites the credential file — prefer its (possibly newer) plan info.
+            credentials = await RefreshAndReloadAsync(credentials, force: false, cancellationToken).ConfigureAwait(false);
+            ObserveCredentialChange(credentials);
             subType = credentials?.SubscriptionType ?? subType;
             tier = credentials?.RateLimitTier ?? tier;
-
-            // Still expired after the refresh attempt (e.g. a blank/invalid refresh token)
-            // means the login is dead and only re-running `claude /login` can fix it.
-            if (credentials?.AccessToken is null || IsTokenExpired(credentials))
-            {
-                return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.Expired, subType, tier);
-            }
         }
 
-        // 3. Check failure gate
-        if (DateTimeOffset.UtcNow < _blockedUntil)
+        if (credentials?.AccessToken is null)
+        {
+            var status = hadRefreshToken ? ClaudeAuthStatus.Expired : ClaudeAuthStatus.NoCredentials;
+            return new ClaudeOAuthOutcome(GetCachedResult(), status, subType, tier);
+        }
+
+        if (IsTokenExpired(credentials))
+        {
+            return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.Expired, subType, tier);
+        }
+
+        if (UtcNow < _blockedUntil)
         {
             return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.Unavailable, subType, tier);
         }
 
-        // 4. Attempt fresh fetch
         var (fresh, fetchStatus) = await TryFetchAsync(credentials, cancellationToken).ConfigureAwait(false);
+
+        // A server can revoke an access token before its local expiresAt. Delegate one
+        // forced refresh to Claude Code, reload its rotated pair, and retry exactly once.
+        if (fresh is null
+            && fetchStatus == ClaudeAuthStatus.Unauthorized
+            && HasUsableRefreshToken(credentials))
+        {
+            var rejectedFingerprint = ComputeFingerprint(credentials);
+            credentials = await RefreshAndReloadAsync(credentials, force: true, cancellationToken).ConfigureAwait(false);
+            ObserveCredentialChange(credentials);
+            subType = credentials?.SubscriptionType ?? subType;
+            tier = credentials?.RateLimitTier ?? tier;
+
+            if (credentials?.AccessToken is not null
+                && ComputeFingerprint(credentials) != rejectedFingerprint
+                && !IsTokenExpired(credentials))
+            {
+                (fresh, fetchStatus) = await TryFetchAsync(credentials, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         if (fresh is not null)
         {
             _consecutiveFailures = 0;
             _blockedUntil = DateTimeOffset.MinValue;
             SetMemoryCache(fresh);
-            _ = WriteDiskCacheAsync(fresh);
+            if (_useDiskCache)
+            {
+                _ = WriteDiskCacheAsync(fresh);
+            }
             return new ClaudeOAuthOutcome(fresh, ClaudeAuthStatus.Ok, subType, tier);
         }
 
-        // 5. Record failure & compute backoff
         _consecutiveFailures++;
-        _blockedUntil = DateTimeOffset.UtcNow + ComputeBackoff(_consecutiveFailures);
+        _blockedUntil = UtcNow + ComputeBackoff(_consecutiveFailures);
 
         return new ClaudeOAuthOutcome(GetCachedResult(), fetchStatus, subType, tier);
     }
@@ -151,8 +182,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
             }
 
             // Distinguish a dead/rejected token from a transient server/network failure.
-            if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized
-                or System.Net.HttpStatusCode.Forbidden)
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
                 return (null, ClaudeAuthStatus.Unauthorized);
             }
@@ -169,140 +199,72 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         }
     }
 
-    /// <summary>
-    /// Starts Claude's normal session initialization and immediately exits. Unlike
-    /// <c>claude auth status</c> (which only reports cached state), session startup
-    /// runs Claude Code's OAuth refresh path. Costats never reads or writes the
-    /// refresh token; after the CLI exits, it reloads the CLI-managed credential store.
-    /// </summary>
-    private async Task TryDelegatedRefreshAsync(CancellationToken cancellationToken)
+    private async Task<ClaudeCredentials?> RefreshAndReloadAsync(
+        ClaudeCredentials observedCredentials,
+        bool force,
+        CancellationToken cancellationToken)
     {
-        if (DateTimeOffset.UtcNow < _refreshBlockedUntil)
+        var gate = RefreshGates.GetOrAdd(_credentialStore.RefreshLockKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            var current = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+            var observedFingerprint = ComputeFingerprint(observedCredentials);
+            var currentFingerprint = ComputeFingerprint(current);
+
+            // Another Costats/Claude process may have rotated the token while this call
+            // waited. Always consume that new pair instead of exchanging the old refresh token.
+            if (currentFingerprint != observedFingerprint
+                && current?.AccessToken is not null
+                && !IsTokenExpired(current))
+            {
+                return current;
+            }
+
+            if (current is null || !HasUsableRefreshToken(current) || UtcNow < _refreshBlockedUntil)
+            {
+                return current;
+            }
+
+            if (!force && current.AccessToken is not null && !IsNearExpiry(current))
+            {
+                return current;
+            }
+
+            var processSucceeded = await _tokenRefresher.RefreshAsync(current, cancellationToken).ConfigureAwait(false);
+            var reloaded = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+            var refreshSucceeded = processSucceeded
+                && reloaded?.AccessToken is not null
+                && !IsTokenExpired(reloaded)
+                && (ComputeFingerprint(reloaded) != currentFingerprint || !IsNearExpiry(reloaded));
+
+            if (!refreshSucceeded)
+            {
+                _refreshBlockedUntil = UtcNow + RefreshFailureCooldown;
+            }
+
+            // Reload even after a nonzero exit in case a concurrent CLI process won.
+            return reloaded;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private void ObserveCredentialChange(ClaudeCredentials? credentials)
+    {
+        var fingerprint = ComputeFingerprint(credentials);
+        if (fingerprint == _lastCredentialFingerprint)
         {
             return;
         }
 
-        try
-        {
-            var claudePath = FindClaudeCli();
-            if (claudePath is null)
-            {
-                _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownFailure;
-                return;
-            }
-
-            using var process = new Process
-            {
-                StartInfo = CreateDelegatedRefreshStartInfo(claudePath, _configDir)
-            };
-
-            process.Start();
-
-            await process.StandardInput.WriteLineAsync("/exit").ConfigureAwait(false);
-            process.StandardInput.Close();
-
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(RefreshTimeout);
-
-            try
-            {
-                await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
-                _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownSuccess;
-            }
-            catch (OperationCanceledException)
-            {
-                // Never leave a hidden Claude process behind after a timeout or shutdown.
-                try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
-
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-
-                // Timed out — retry soon on the next refresh.
-                _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownFailure;
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            _refreshBlockedUntil = DateTimeOffset.UtcNow + RefreshCooldownFailure;
-        }
-    }
-
-    internal static ProcessStartInfo CreateDelegatedRefreshStartInfo(string claudePath, string? configDir)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = claudePath,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        startInfo.ArgumentList.Add("/status");
-
-        // Propagate the profile config dir so Claude Code uses the right credentials.
-        if (configDir is not null)
-        {
-            startInfo.Environment["CLAUDE_CONFIG_DIR"] = configDir;
-        }
-
-        return startInfo;
-    }
-
-    private static string? FindClaudeCli()
-    {
-        // Check well-known locations
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var candidates = new[]
-        {
-            Path.Combine(home, ".local", "bin", "claude.exe"),
-            Path.Combine(home, ".local", "bin", "claude"),
-        };
-
-        foreach (var path in candidates)
-        {
-            if (File.Exists(path))
-            {
-                return path;
-            }
-        }
-
-        // Fall back to PATH
-        try
-        {
-            using var process = new Process();
-            process.StartInfo = new ProcessStartInfo
-            {
-                FileName = OperatingSystem.IsWindows() ? "where" : "which",
-                Arguments = "claude",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true
-            };
-            process.Start();
-            var output = process.StandardOutput.ReadLine();
-            process.WaitForExit(2000);
-            if (!string.IsNullOrWhiteSpace(output) && File.Exists(output))
-            {
-                return output;
-            }
-        }
-        catch
-        {
-            // Ignore — CLI not available
-        }
-
-        return null;
+        _lastCredentialFingerprint = fingerprint;
+        _consecutiveFailures = 0;
+        _blockedUntil = DateTimeOffset.MinValue;
+        _refreshBlockedUntil = DateTimeOffset.MinValue;
     }
 
     //  Backoff
@@ -319,7 +281,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     private void SetMemoryCache(ClaudeOAuthUsageResult result)
     {
         _memoryCache = result;
-        _memoryCacheWrittenAt = DateTimeOffset.UtcNow;
+        _memoryCacheWrittenAt = UtcNow;
     }
 
     /// <summary>
@@ -330,10 +292,15 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     {
         // Try memory cache (30 min TTL)
         if (_memoryCache is not null
-            && DateTimeOffset.UtcNow - _memoryCacheWrittenAt <= MemoryCacheTtl
+            && UtcNow - _memoryCacheWrittenAt <= MemoryCacheTtl
             && IsCacheValid(_memoryCache))
         {
             return _memoryCache;
+        }
+
+        if (!_useDiskCache)
+        {
+            return null;
         }
 
         // Try disk cache
@@ -347,9 +314,9 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         return null;
     }
 
-    private static bool IsCacheValid(ClaudeOAuthUsageResult cached)
+    private bool IsCacheValid(ClaudeOAuthUsageResult cached)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = UtcNow;
 
         if (now - cached.FetchedAt > MaxCacheAge)
         {
@@ -420,55 +387,21 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         return Convert.ToHexString(hash, 0, 8);
     }
 
-    private static bool IsTokenExpired(ClaudeCredentials credentials)
-    {
-        return credentials.ExpiresAt.HasValue
-            && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() > credentials.ExpiresAt.Value;
-    }
+    private bool IsTokenExpired(ClaudeCredentials credentials)
+        => credentials.ExpiresAt.HasValue
+           && UtcNow.ToUnixTimeMilliseconds() >= credentials.ExpiresAt.Value;
 
-    private static async Task<ClaudeCredentials?> LoadCredentialsAsync(string? configDir)
-    {
-        string credentialsPath;
-        if (configDir is not null)
-        {
-            credentialsPath = Path.Combine(configDir, ".credentials.json");
-        }
-        else
-        {
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            credentialsPath = Path.Combine(home, ".claude", ".credentials.json");
-        }
+    private bool IsNearExpiry(ClaudeCredentials credentials)
+        => credentials.ExpiresAt.HasValue
+           && UtcNow.Add(ProactiveRefreshWindow).ToUnixTimeMilliseconds() >= credentials.ExpiresAt.Value;
 
-        if (!File.Exists(credentialsPath))
-        {
-            return null;
-        }
-
-        try
-        {
-            var json = await File.ReadAllTextAsync(credentialsPath);
-            using var doc = JsonDocument.Parse(json);
-
-            if (!doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth))
-            {
-                return null;
-            }
-
-            return new ClaudeCredentials(
-                oauth.TryGetProperty("accessToken", out var at) ? at.GetString() : null,
-                oauth.TryGetProperty("refreshToken", out var rt) ? rt.GetString() : null,
-                oauth.TryGetProperty("expiresAt", out var exp) ? exp.GetInt64() : null,
-                oauth.TryGetProperty("subscriptionType", out var st) ? st.GetString() : null,
-                oauth.TryGetProperty("rateLimitTier", out var rlt) ? rlt.GetString() : null);
-        }
-        catch
-        {
-            return null;
-        }
-    }
+    private bool HasUsableRefreshToken(ClaudeCredentials? credentials)
+        => credentials?.RefreshToken is not null
+           && (!credentials.RefreshTokenExpiresAt.HasValue
+               || UtcNow.ToUnixTimeMilliseconds() < credentials.RefreshTokenExpiresAt.Value);
 
     //  Response parsing
-    private static ClaudeOAuthUsageResult? ParseResponse(string json, string? subscriptionType, string? rateLimitTier)
+    private ClaudeOAuthUsageResult? ParseResponse(string json, string? subscriptionType, string? rateLimitTier)
     {
         try
         {
@@ -544,7 +477,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
                 extraLimit,
                 subscriptionType,
                 rateLimitTier,
-                DateTimeOffset.UtcNow);
+                UtcNow);
         }
         catch
         {
@@ -571,15 +504,13 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
 
     public void Dispose()
     {
-        _httpClient.Dispose();
+        if (_disposeHttpClient)
+        {
+            _httpClient.Dispose();
+        }
     }
 
-    private sealed record ClaudeCredentials(
-        string? AccessToken,
-        string? RefreshToken,
-        long? ExpiresAt,
-        string? SubscriptionType,
-        string? RateLimitTier);
+    private DateTimeOffset UtcNow => _timeProvider.GetUtcNow();
 }
 
 public sealed record ClaudeOAuthUsageResult(
