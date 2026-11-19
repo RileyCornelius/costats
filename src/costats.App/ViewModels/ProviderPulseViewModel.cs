@@ -180,18 +180,20 @@ public sealed partial class ProviderPulseViewModel : ObservableObject
 
         var usedPercent = CalculateUsedPercent(usage.SessionUsed, usage.SessionLimit);
         vm.SessionProgress = usedPercent / 100.0;
-        vm.SessionUsageLabel = FormatUsageLabel(usedPercent, usage.SessionUsed);
+        vm.SessionUsageLabel = FormatUsageLabel(usedPercent, usage.SessionUsed, usage.SessionLimit);
 
         // Reset text
         if (usage.SessionWindow?.ResetsAt is { } sessionResets)
         {
             vm.SessionResetText = $"Resets {UsageFormatter.ResetCountdown(sessionResets)}";
 
-            // Pace calculation
-            var pace = UsagePace.Calculate(
-                usedPercent,
-                sessionResets,
-                usage.SessionWindow.Duration);
+            // Pace needs a real percentage; raw log token counts have no known limit.
+            var pace = usage.SessionLimit is null
+                ? null
+                : UsagePace.Calculate(
+                    usedPercent,
+                    sessionResets,
+                    usage.SessionWindow.Duration);
 
             if (pace is not null)
             {
@@ -216,18 +218,20 @@ public sealed partial class ProviderPulseViewModel : ObservableObject
 
         var usedPercent = CalculateUsedPercent(usage.WeekUsed, usage.WeekLimit);
         vm.WeekProgress = usedPercent / 100.0;
-        vm.WeekUsageLabel = FormatUsageLabel(usedPercent, usage.WeekUsed);
+        vm.WeekUsageLabel = FormatUsageLabel(usedPercent, usage.WeekUsed, usage.WeekLimit);
 
         // Reset text
         if (usage.WeekWindow?.ResetsAt is { } weekResets)
         {
             vm.WeekResetText = $"Resets {UsageFormatter.ResetCountdown(weekResets)}";
 
-            // Pace calculation
-            var pace = UsagePace.Calculate(
-                usedPercent,
-                weekResets,
-                usage.WeekWindow.Duration);
+            // Pace needs a real percentage; raw log token counts have no known limit.
+            var pace = usage.WeekLimit is null
+                ? null
+                : UsagePace.Calculate(
+                    usedPercent,
+                    weekResets,
+                    usage.WeekWindow.Duration);
 
             if (pace is not null)
             {
@@ -322,11 +326,17 @@ public sealed partial class ProviderPulseViewModel : ObservableObject
         return Math.Clamp((double)used.Value / limit.Value * 100, 0, 100);
     }
 
-    private static string FormatUsageLabel(double usedPercent, long? used)
+    private static string FormatUsageLabel(double usedPercent, long? used, long? limit)
     {
         if (used is null || used == 0)
         {
             return "0% used";
+        }
+
+        // Log-based fallback: raw token counts with no known limit, so no percentage exists.
+        if (limit is null)
+        {
+            return $"{UsageFormatter.FormatTokenCount(used.Value)} tokens";
         }
 
         return $"{(int)Math.Round(usedPercent)}% used";
