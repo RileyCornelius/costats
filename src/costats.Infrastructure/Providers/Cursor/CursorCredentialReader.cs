@@ -29,8 +29,14 @@ public sealed class CursorCredentialReader
     /// </summary>
     public CursorCredentials? ReadLocalCredentials()
     {
-        var dbPath = ResolveStateDbPath();
-        if (dbPath is null || !File.Exists(dbPath))
+        var dataDir = ResolveDataDir();
+        if (dataDir is null)
+        {
+            return null;
+        }
+
+        var dbPath = Path.Combine(dataDir, "User", "globalStorage", "state.vscdb");
+        if (!File.Exists(dbPath))
         {
             return null;
         }
@@ -42,6 +48,15 @@ public sealed class CursorCredentialReader
             if (!values.TryGetValue(AccessTokenKey, out var accessToken) || string.IsNullOrWhiteSpace(accessToken))
             {
                 return null;
+            }
+
+            if (CursorSafeStorage.IsEncrypted(accessToken))
+            {
+                accessToken = DecryptSafeStorageValue(dataDir, accessToken);
+                if (accessToken is null)
+                {
+                    return null;
+                }
             }
 
             var userId = DeriveUserId(accessToken, values.GetValueOrDefault(StatsigBootstrapKey));
@@ -117,23 +132,40 @@ public sealed class CursorCredentialReader
     }
 
     /// <summary>
-    /// Resolves the state.vscdb path: CURSOR_DATA_DIR override, then %APPDATA%\Cursor.
+    /// Resolves Cursor's user data directory: CURSOR_DATA_DIR override, then %APPDATA%\Cursor.
     /// </summary>
-    private static string? ResolveStateDbPath()
+    private static string? ResolveDataDir()
     {
         var overrideDir = Environment.GetEnvironmentVariable("CURSOR_DATA_DIR");
         if (!string.IsNullOrWhiteSpace(overrideDir))
         {
-            return Path.Combine(overrideDir, "User", "globalStorage", "state.vscdb");
+            return overrideDir;
         }
 
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        if (string.IsNullOrEmpty(appData))
+        return string.IsNullOrEmpty(appData) ? null : Path.Combine(appData, "Cursor");
+    }
+
+    /// <summary>
+    /// Newer Cursor builds encrypt auth values with Electron safeStorage; the key lives in
+    /// "Local State" next to the User directory.
+    /// </summary>
+    private string? DecryptSafeStorageValue(string dataDir, string value)
+    {
+        var key = CursorSafeStorage.LoadMasterKey(Path.Combine(dataDir, "Local State"));
+        if (key is null)
         {
+            _logger.LogDebug("Cursor token is safeStorage-encrypted but the Local State key is unavailable");
             return null;
         }
 
-        return Path.Combine(appData, "Cursor", "User", "globalStorage", "state.vscdb");
+        var decrypted = CursorSafeStorage.Decrypt(value, key);
+        if (decrypted is null)
+        {
+            _logger.LogDebug("Cursor safeStorage token could not be decrypted");
+        }
+
+        return decrypted;
     }
 
     private Dictionary<string, string> ReadItemTableValues(string dbPath, params string[] keys)
