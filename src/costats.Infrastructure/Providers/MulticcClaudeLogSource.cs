@@ -2,6 +2,7 @@ using costats.Application.Pulse;
 using costats.Core.Pulse;
 using costats.Infrastructure.Expense;
 using costats.Infrastructure.Usage;
+using Microsoft.Extensions.Logging;
 
 namespace costats.Infrastructure.Providers;
 
@@ -20,10 +21,10 @@ public sealed class MulticcClaudeLogSource : ISignalSource, IDisposable
     private readonly ExpenseAnalyzer _expenseAnalyzer;
     private readonly string _logDirectory;
 
-    public MulticcClaudeLogSource(MulticcProfile profile, ExpenseAnalyzer expenseAnalyzer)
+    public MulticcClaudeLogSource(MulticcProfile profile, ExpenseAnalyzer expenseAnalyzer, ILogger<MulticcClaudeLogSource> logger)
     {
         _profile = profile;
-        _oauthFetcher = new ClaudeOAuthUsageFetcher(profile.ConfigDir);
+        _oauthFetcher = new ClaudeOAuthUsageFetcher(profile.ConfigDir, logger);
         _expenseAnalyzer = expenseAnalyzer;
         _logDirectory = Path.Combine(profile.ConfigDir, "projects");
     }

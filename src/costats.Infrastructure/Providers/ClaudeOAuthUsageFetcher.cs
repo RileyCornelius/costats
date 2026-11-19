@@ -2,12 +2,25 @@ using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace costats.Infrastructure.Providers;
 
 /// <summary>
 /// Fetches Claude usage data via the Anthropic OAuth API.
 /// </summary>
+/// <remarks>
+/// Uses the terminal CLI's login (<c>~/.claude/.credentials.json</c>). By default Costats only
+/// reads it and leaves rotation to Claude Code, so it can never be the process that burns a
+/// single-use refresh token. Setting <c>COSTATS_CLAUDE_REFRESH=1</c> lets Costats keep the
+/// login alive for people who never run the CLI. When enabled, Costats refreshes
+/// exactly the way Claude Code does: only near expiry, only while holding Claude Code's own
+/// cross-process refresh locks, re-reading the file under the lock to adopt a pair another
+/// process already rotated, and saving with compare-and-swap. The token exchange and save
+/// never observe the caller's cancellation, because abandoning them after the server
+/// rotates the pair would burn the only refresh token.
+/// </remarks>
 public sealed class ClaudeOAuthUsageFetcher : IDisposable
 {
     private const string BaseUrl = "https://api.anthropic.com";
@@ -20,32 +33,35 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
     private static readonly TimeSpan MaxCacheAge = TimeSpan.FromHours(6);
     private static readonly TimeSpan MemoryCacheTtl = TimeSpan.FromMinutes(30);
 
-    // Match Claude Code's own five-minute early-refresh window. This keeps Costats
-    // from being the process that discovers an expired access token after a day idle.
-    private static readonly TimeSpan ProactiveRefreshWindow = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan RefreshFailureCooldown = TimeSpan.FromSeconds(20);
+    // Claude Code refreshes within five minutes of expiry; match it so both agree on timing.
+    private static readonly TimeSpan RefreshWindow = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan RefreshFailureCooldown = TimeSpan.FromMinutes(1);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> RefreshGates = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly HttpClient _httpClient;
+    private readonly HttpClient? _tokenHttpClient;
     private readonly bool _disposeHttpClient;
     private readonly bool _useDiskCache;
     private readonly string? _configDir;
     private readonly IClaudeCredentialStore _credentialStore;
-    private readonly IClaudeTokenRefresher _tokenRefresher;
+    private readonly IClaudeRefreshLock _refreshLock;
+    private readonly IClaudeTokenEndpoint _tokenEndpoint;
     private readonly TimeProvider _timeProvider;
+    private readonly ILogger _logger;
+    private readonly bool _allowRefresh;
 
     private int _consecutiveFailures;
     private DateTimeOffset _blockedUntil = DateTimeOffset.MinValue;
+    private DateTimeOffset _refreshBlockedUntil = DateTimeOffset.MinValue;
+    private string? _deadRefreshTokenFingerprint;
     private string? _lastCredentialFingerprint;
     private ClaudeOAuthUsageResult? _memoryCache;
     private DateTimeOffset _memoryCacheWrittenAt = DateTimeOffset.MinValue;
-    private DateTimeOffset _refreshBlockedUntil = DateTimeOffset.MinValue;
+    private ClaudeAuthStatus? _lastLoggedStatus;
+    private long? _observedExpiresAt;
+    private long? _observedRefreshTokenExpiresAt;
 
-    public ClaudeOAuthUsageFetcher() : this(configDir: null)
-    {
-    }
-
-    public ClaudeOAuthUsageFetcher(string? configDir)
+    public ClaudeOAuthUsageFetcher(string? configDir, ILogger? logger = null)
     {
         configDir = ClaudeCredentialStore.ResolveConfigDir(configDir);
         _configDir = configDir;
@@ -57,58 +73,73 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         _httpClient.DefaultRequestHeaders.Add("anthropic-beta", BetaHeader);
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "claude-code/2.1.70");
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        _tokenHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
         _disposeHttpClient = true;
         _useDiskCache = true;
         _credentialStore = new ClaudeCredentialStore(configDir);
-        _tokenRefresher = new ClaudeCliTokenRefresher(configDir);
+        _refreshLock = new ClaudeRefreshLock();
         _timeProvider = TimeProvider.System;
+        _tokenEndpoint = new ClaudeTokenEndpoint(_tokenHttpClient, _timeProvider);
+        _logger = logger ?? NullLogger.Instance;
+        _allowRefresh = Environment.GetEnvironmentVariable("COSTATS_CLAUDE_REFRESH") == "1";
+        _logger.LogInformation(
+            "Claude token refresh by Costats is {Mode} (profile {Profile})",
+            _allowRefresh ? "enabled" : "disabled; Claude Code owns rotation",
+            _configDir ?? "default");
     }
 
     internal ClaudeOAuthUsageFetcher(
         HttpClient httpClient,
         IClaudeCredentialStore credentialStore,
-        IClaudeTokenRefresher tokenRefresher,
-        TimeProvider? timeProvider = null)
+        IClaudeRefreshLock refreshLock,
+        IClaudeTokenEndpoint tokenEndpoint,
+        TimeProvider? timeProvider = null,
+        bool allowRefresh = true)
     {
+        _allowRefresh = allowRefresh;
         _httpClient = httpClient;
         _configDir = null;
         _useDiskCache = false;
         _credentialStore = credentialStore;
-        _tokenRefresher = tokenRefresher;
+        _refreshLock = refreshLock;
+        _tokenEndpoint = tokenEndpoint;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _logger = NullLogger.Instance;
     }
 
     //  Public API
     public async Task<ClaudeOAuthOutcome> FetchAsync(CancellationToken cancellationToken)
+    {
+        var outcome = await FetchCoreAsync(cancellationToken).ConfigureAwait(false);
+        LogStatusTransition(outcome.Status);
+        return outcome;
+    }
+
+    private async Task<ClaudeOAuthOutcome> FetchCoreAsync(CancellationToken cancellationToken)
     {
         var credentials = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         ObserveCredentialChange(credentials);
 
         var subType = credentials?.SubscriptionType;
         var tier = credentials?.RateLimitTier;
-        var hadRefreshToken = HasUsableRefreshToken(credentials);
 
-        // Refresh a missing access token when a recoverable refresh credential remains,
-        // and refresh five minutes early to avoid the normal one-day expiry gap.
-        if (credentials is not null
-            && HasUsableRefreshToken(credentials)
-            && (credentials.AccessToken is null || IsNearExpiry(credentials)))
+        if (credentials is null || (credentials.AccessToken is null && credentials.RefreshToken is null))
         {
-            credentials = await RefreshAndReloadAsync(credentials, force: false, cancellationToken).ConfigureAwait(false);
-            ObserveCredentialChange(credentials);
-            subType = credentials?.SubscriptionType ?? subType;
-            tier = credentials?.RateLimitTier ?? tier;
+            return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.NoCredentials, subType, tier);
         }
 
-        if (credentials?.AccessToken is null)
+        var refreshedThisCall = false;
+        if (NeedsRefresh(credentials, force: false))
         {
-            var status = hadRefreshToken ? ClaudeAuthStatus.Expired : ClaudeAuthStatus.NoCredentials;
-            return new ClaudeOAuthOutcome(GetCachedResult(), status, subType, tier);
+            credentials = await RefreshAsync(credentials, force: false, cancellationToken).ConfigureAwait(false);
+            refreshedThisCall = true;
+            subType = credentials.SubscriptionType ?? subType;
+            tier = credentials.RateLimitTier ?? tier;
         }
 
-        if (IsTokenExpired(credentials))
+        if (credentials.AccessToken is null || IsTokenExpired(credentials))
         {
-            return new ClaudeOAuthOutcome(GetCachedResult(), ClaudeAuthStatus.Expired, subType, tier);
+            return new ClaudeOAuthOutcome(GetCachedResult(), ClassifyUnusableAccessToken(credentials), subType, tier);
         }
 
         if (UtcNow < _blockedUntil)
@@ -118,23 +149,29 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
 
         var (fresh, fetchStatus) = await TryFetchAsync(credentials, cancellationToken).ConfigureAwait(false);
 
-        // A server can revoke an access token before its local expiresAt. Delegate one
-        // forced refresh to Claude Code, reload its rotated pair, and retry exactly once.
-        if (fresh is null
-            && fetchStatus == ClaudeAuthStatus.Unauthorized
-            && HasUsableRefreshToken(credentials))
+        // A rejected unexpired token was either rotated by another process since we read it,
+        // or revoked server-side. Adopt a newer pair from disk, otherwise force one refresh.
+        if (fresh is null && fetchStatus == ClaudeAuthStatus.Unauthorized)
         {
             var rejectedFingerprint = ComputeFingerprint(credentials);
-            credentials = await RefreshAndReloadAsync(credentials, force: true, cancellationToken).ConfigureAwait(false);
-            ObserveCredentialChange(credentials);
-            subType = credentials?.SubscriptionType ?? subType;
-            tier = credentials?.RateLimitTier ?? tier;
+            var reloaded = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false) ?? credentials;
+            ObserveCredentialChange(reloaded);
 
-            if (credentials?.AccessToken is not null
-                && ComputeFingerprint(credentials) != rejectedFingerprint
-                && !IsTokenExpired(credentials))
+            if (ComputeFingerprint(reloaded) == rejectedFingerprint && !refreshedThisCall)
             {
-                (fresh, fetchStatus) = await TryFetchAsync(credentials, cancellationToken).ConfigureAwait(false);
+                reloaded = await RefreshAsync(reloaded, force: true, cancellationToken).ConfigureAwait(false);
+            }
+
+            subType = reloaded.SubscriptionType ?? subType;
+            tier = reloaded.RateLimitTier ?? tier;
+
+            if (reloaded.AccessToken is null || IsTokenExpired(reloaded))
+            {
+                fetchStatus = ClassifyUnusableAccessToken(reloaded);
+            }
+            else if (ComputeFingerprint(reloaded) != rejectedFingerprint)
+            {
+                (fresh, fetchStatus) = await TryFetchAsync(reloaded, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -156,23 +193,121 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         return new ClaudeOAuthOutcome(GetCachedResult(), fetchStatus, subType, tier);
     }
 
+    /// <summary>
+    /// A dead login needs <c>claude /login</c>. Anything else (refresh lock busy or a
+    /// network failure) is transient and retried on the next poll.
+    /// </summary>
+    private ClaudeAuthStatus ClassifyUnusableAccessToken(ClaudeCredentials credentials)
+        => HasUsableRefreshToken(credentials)
+            ? ClaudeAuthStatus.Unavailable
+            : ClaudeAuthStatus.Expired;
+
+    /// <summary>
+    /// Rotates the pair the way Claude Code does and returns the credentials now on disk.
+    /// Returns the input unchanged when no refresh happened.
+    /// </summary>
+    private async Task<ClaudeCredentials> RefreshAsync(
+        ClaudeCredentials observed,
+        bool force,
+        CancellationToken cancellationToken)
+    {
+        if (!_allowRefresh || !HasUsableRefreshToken(observed) || UtcNow < _refreshBlockedUntil)
+        {
+            return observed;
+        }
+
+        var gate = RefreshGates.GetOrAdd(_credentialStore.ConfigDirectory, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Another fetcher in this process may have refreshed while we waited.
+            var current = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false) ?? observed;
+            if (ComputeFingerprint(current) != ComputeFingerprint(observed) || !NeedsRefresh(current, force))
+            {
+                return current;
+            }
+
+            await using var held = await _refreshLock
+                .TryAcquireAsync(_credentialStore.ConfigDirectory, cancellationToken)
+                .ConfigureAwait(false);
+            if (held is null)
+            {
+                // Claude Code is refreshing right now; its new pair shows up on disk shortly.
+                _logger.LogInformation("Claude token refresh skipped: another process holds the refresh lock");
+                _refreshBlockedUntil = UtcNow + RefreshFailureCooldown;
+                return await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false) ?? current;
+            }
+
+            // Re-read under the lock, exactly like Claude Code, and adopt any pair rotated
+            // by a process that released the lock just before we took it.
+            var locked = await _credentialStore.LoadAsync(CancellationToken.None).ConfigureAwait(false) ?? current;
+            if (ComputeFingerprint(locked) != ComputeFingerprint(observed)
+                || !NeedsRefresh(locked, force)
+                || !HasUsableRefreshToken(locked))
+            {
+                return locked;
+            }
+
+            // From here on, never cancel: the server may rotate the pair at any moment.
+            var result = await _tokenEndpoint.RefreshAsync(locked, CancellationToken.None).ConfigureAwait(false);
+            switch (result.Outcome)
+            {
+                case ClaudeTokenRefreshOutcome.DeadGrant:
+                    _deadRefreshTokenFingerprint = Fingerprint(locked.RefreshToken);
+                    _logger.LogWarning("Claude refresh token was rejected (invalid_grant); run claude /login");
+                    return locked;
+
+                case ClaudeTokenRefreshOutcome.Transient:
+                    _refreshBlockedUntil = UtcNow + RefreshFailureCooldown;
+                    _logger.LogWarning("Claude token refresh failed transiently; retrying after cooldown");
+                    return locked;
+            }
+
+            var saved = await _credentialStore
+                .SaveRefreshedAsync(locked.RefreshToken!, result.Tokens!, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (saved)
+            {
+                _logger.LogInformation(
+                    "Refreshed Claude login; access token expires {AccessTokenExpiresAt}",
+                    FormatEpochMs(result.Tokens!.ExpiresAt));
+            }
+            else
+            {
+                _logger.LogWarning("Claude credentials changed during refresh; adopting the newer pair on disk");
+            }
+
+            var reloaded = await _credentialStore.LoadAsync(CancellationToken.None).ConfigureAwait(false) ?? locked;
+            ObserveCredentialChange(reloaded);
+            return reloaded;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _refreshBlockedUntil = UtcNow + RefreshFailureCooldown;
+            _logger.LogError(ex, "Claude token refresh failed");
+            return await _credentialStore.LoadAsync(CancellationToken.None).ConfigureAwait(false) ?? observed;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private bool NeedsRefresh(ClaudeCredentials credentials, bool force)
+        => force || credentials.AccessToken is null || IsNearExpiry(credentials);
+
     //  HTTP
     private async Task<(ClaudeOAuthUsageResult? Result, ClaudeAuthStatus Status)> TryFetchAsync(
-        ClaudeCredentials? credentials, CancellationToken cancellationToken)
+        ClaudeCredentials credentials, CancellationToken cancellationToken)
     {
         try
         {
-            if (credentials?.AccessToken is null || IsTokenExpired(credentials))
-            {
-                return (null, ClaudeAuthStatus.Expired);
-            }
-
             cancellationToken.ThrowIfCancellationRequested();
 
             using var request = new HttpRequestMessage(HttpMethod.Get, UsagePath);
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.AccessToken);
 
-            var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (response.IsSuccessStatusCode)
             {
@@ -199,73 +334,69 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         }
     }
 
-    private async Task<ClaudeCredentials?> RefreshAndReloadAsync(
-        ClaudeCredentials observedCredentials,
-        bool force,
-        CancellationToken cancellationToken)
-    {
-        var gate = RefreshGates.GetOrAdd(_credentialStore.RefreshLockKey, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        try
-        {
-            var current = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-            var observedFingerprint = ComputeFingerprint(observedCredentials);
-            var currentFingerprint = ComputeFingerprint(current);
-
-            // Another Costats/Claude process may have rotated the token while this call
-            // waited. Always consume that new pair instead of exchanging the old refresh token.
-            if (currentFingerprint != observedFingerprint
-                && current?.AccessToken is not null
-                && !IsTokenExpired(current))
-            {
-                return current;
-            }
-
-            if (current is null || !HasUsableRefreshToken(current) || UtcNow < _refreshBlockedUntil)
-            {
-                return current;
-            }
-
-            if (!force && current.AccessToken is not null && !IsNearExpiry(current))
-            {
-                return current;
-            }
-
-            var processSucceeded = await _tokenRefresher.RefreshAsync(current, cancellationToken).ConfigureAwait(false);
-            var reloaded = await _credentialStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-            var refreshSucceeded = processSucceeded
-                && reloaded?.AccessToken is not null
-                && !IsTokenExpired(reloaded)
-                && (ComputeFingerprint(reloaded) != currentFingerprint || !IsNearExpiry(reloaded));
-
-            if (!refreshSucceeded)
-            {
-                _refreshBlockedUntil = UtcNow + RefreshFailureCooldown;
-            }
-
-            // Reload even after a nonzero exit in case a concurrent CLI process won.
-            return reloaded;
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
     private void ObserveCredentialChange(ClaudeCredentials? credentials)
     {
+        _observedExpiresAt = credentials?.ExpiresAt;
+        _observedRefreshTokenExpiresAt = credentials?.RefreshTokenExpiresAt;
+
         var fingerprint = ComputeFingerprint(credentials);
         if (fingerprint == _lastCredentialFingerprint)
         {
             return;
         }
 
+        if (_lastCredentialFingerprint is not null)
+        {
+            // Claude Code rotated or replaced the pair. Timestamps only, never token material.
+            _logger.LogInformation(
+                "Claude credentials changed on disk; access token expires {AccessTokenExpiresAt}",
+                FormatEpochMs(credentials?.ExpiresAt));
+
+            if (credentials is not null && credentials.AccessToken is null && credentials.RefreshToken is null)
+            {
+                // Claude Code blanks the pair after the server answers a refresh with
+                // invalid_grant. loginEnded "time_limit" means the server called the refresh
+                // token expired; absent means it was rejected for another reason (e.g. reuse).
+                _logger.LogWarning(
+                    "Claude Code cleared the login after a rejected refresh (loginEnded {LoginEnded}); costats refresh {Mode}",
+                    credentials.LoginEnded ?? "not set",
+                    _allowRefresh ? "enabled" : "disabled");
+            }
+        }
+
         _lastCredentialFingerprint = fingerprint;
         _consecutiveFailures = 0;
         _blockedUntil = DateTimeOffset.MinValue;
-        _refreshBlockedUntil = DateTimeOffset.MinValue;
     }
+
+    /// <summary>
+    /// Logs auth state changes so a forced re-login can be traced to Claude Code rather
+    /// than Costats. Logs once per transition, with timestamps only.
+    /// </summary>
+    private void LogStatusTransition(ClaudeAuthStatus status)
+    {
+        if (status == _lastLoggedStatus)
+        {
+            return;
+        }
+
+        var previous = _lastLoggedStatus;
+        _lastLoggedStatus = status;
+        var level = ClaudeIdentity.IsSignInRequired(status) ? LogLevel.Warning : LogLevel.Information;
+        _logger.Log(
+            level,
+            "Claude auth status {PreviousStatus} -> {Status} (profile {Profile}); access token expires {AccessTokenExpiresAt}, refresh token expires {RefreshTokenExpiresAt}",
+            previous?.ToString() ?? "(start)",
+            status,
+            _configDir ?? "default",
+            FormatEpochMs(_observedExpiresAt),
+            FormatEpochMs(_observedRefreshTokenExpiresAt));
+    }
+
+    private static string FormatEpochMs(long? epochMs)
+        => epochMs is { } value
+            ? DateTimeOffset.FromUnixTimeMilliseconds(value).ToString("u")
+            : "unknown";
 
     //  Backoff
     private static TimeSpan ComputeBackoff(int failures)
@@ -313,6 +444,13 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
 
         return null;
     }
+
+    /// <summary>
+    /// The most recent API result regardless of age. Only its reset timestamps are reused,
+    /// to project reset times for sources that lack them.
+    /// </summary>
+    public ClaudeOAuthUsageResult? GetLastKnownResult()
+        => _memoryCache ?? (_useDiskCache ? ReadDiskCache() : null);
 
     private bool IsCacheValid(ClaudeOAuthUsageResult cached)
     {
@@ -376,14 +514,16 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
 
     //  Credential helpers
     private static string? ComputeFingerprint(ClaudeCredentials? credentials)
+        => Fingerprint(credentials?.AccessToken);
+
+    private static string? Fingerprint(string? token)
     {
-        if (credentials?.AccessToken is null)
+        if (token is null)
         {
             return null;
         }
 
-        var bytes = System.Text.Encoding.UTF8.GetBytes(credentials.AccessToken);
-        var hash = SHA256.HashData(bytes);
+        var hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(token));
         return Convert.ToHexString(hash, 0, 8);
     }
 
@@ -393,10 +533,15 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
 
     private bool IsNearExpiry(ClaudeCredentials credentials)
         => credentials.ExpiresAt.HasValue
-           && UtcNow.Add(ProactiveRefreshWindow).ToUnixTimeMilliseconds() >= credentials.ExpiresAt.Value;
+           && (UtcNow + RefreshWindow).ToUnixTimeMilliseconds() >= credentials.ExpiresAt.Value;
 
+    /// <summary>
+    /// False once the server rejected this refresh token, so a dead login is never retried
+    /// (Claude Code keeps the same "known dead" list). A new login clears it.
+    /// </summary>
     private bool HasUsableRefreshToken(ClaudeCredentials? credentials)
         => credentials?.RefreshToken is not null
+           && Fingerprint(credentials.RefreshToken) != _deadRefreshTokenFingerprint
            && (!credentials.RefreshTokenExpiresAt.HasValue
                || UtcNow.ToUnixTimeMilliseconds() < credentials.RefreshTokenExpiresAt.Value);
 
@@ -507,6 +652,7 @@ public sealed class ClaudeOAuthUsageFetcher : IDisposable
         if (_disposeHttpClient)
         {
             _httpClient.Dispose();
+            _tokenHttpClient?.Dispose();
         }
     }
 
@@ -533,10 +679,13 @@ public enum ClaudeAuthStatus
     /// <summary>Token is valid and usage was fetched.</summary>
     Ok,
 
-    /// <summary>Access token is expired and could not be refreshed (e.g. no refresh token) — re-login required.</summary>
+    /// <summary>
+    /// Access token is expired and the refresh token is gone, expired or rejected by the
+    /// server. Re-login required.
+    /// </summary>
     Expired,
 
-    /// <summary>The API rejected the token (401/403) — re-login required.</summary>
+    /// <summary>The API rejected the token even after a refresh (401). Re-login required.</summary>
     Unauthorized,
 
     /// <summary>No credentials file / no access token present — sign-in required.</summary>

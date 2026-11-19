@@ -314,12 +314,16 @@ namespace costats.App
             services.AddSingleton<ISignalSource>(sp =>
                 new MulticcClaudeLogSource(
                     profile,
-                    sp.GetRequiredService<ExpenseAnalyzer>()));
+                    sp.GetRequiredService<ExpenseAnalyzer>(),
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<MulticcClaudeLogSource>>()));
         }
 
         private TrayHost InitializeHost(ISettingsStore settingsStore, AppSettings settings, ThemeService themeService)
         {
             _host = Host.CreateDefaultBuilder()
+                // Default content root is the working directory, which varies by launcher;
+                // appsettings.json (including the log sink) lives next to the exe.
+                .UseContentRoot(AppContext.BaseDirectory)
                 .ConfigureAppConfiguration(config =>
                 {
                     config.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);

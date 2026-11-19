@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Http.Headers;
 using System.Text;
 using costats.Infrastructure.Providers;
 using Xunit;
@@ -17,186 +16,355 @@ public sealed class ClaudeOAuthUsageFetcherTests
         """;
 
     [Fact]
-    public void CreateRefreshStartInfo_UsesLockSafeClaudeStartup_WithoutSecretArguments()
-    {
-        var startInfo = ClaudeCliTokenRefresher.CreateRefreshStartInfo(
-            @"C:\Users\test\.local\bin\claude.exe",
-            @"C:\Users\test\Claude Profile");
-
-        Assert.Equal(["--print", "--no-session-persistence", "--tools", "", "/usage"], startInfo.ArgumentList);
-        Assert.Equal(@"C:\Users\test\Claude Profile", startInfo.Environment["CLAUDE_CONFIG_DIR"]);
-        Assert.DoesNotContain("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", startInfo.Environment.Keys);
-        Assert.False(startInfo.UseShellExecute);
-        Assert.True(startInfo.CreateNoWindow);
-    }
-
-    [Fact]
-    public async Task FetchAsync_CurrentLoggedOutShape_DoesNotAttemptImpossibleRefresh()
+    public async Task FetchAsync_CurrentLoggedOutShape_ReportsNoCredentials()
     {
         var parsed = ClaudeCredentialStore.Parse("""
             { "claudeAiOauth": {
               "accessToken": "", "refreshToken": "", "expiresAt": 0,
               "refreshTokenExpiresAt": 1786067460000,
-              "scopes": ["user:profile"], "subscriptionType": "pro"
+              "scopes": ["user:profile"], "subscriptionType": "pro",
+              "loginEnded": "time_limit"
             } }
             """);
+        Assert.Equal("time_limit", parsed!.LoginEnded);
         var store = new FakeCredentialStore(parsed);
-        var refresher = new FakeRefresher(store, refreshed: null);
+        var endpoint = new FakeTokenEndpoint();
         var handler = new ScriptedHandler(_ => throw new InvalidOperationException("HTTP must not be called"));
-        using var fetcher = CreateFetcher(store, refresher, handler);
+        using var fetcher = CreateFetcher(store, handler, endpoint);
 
         var outcome = await fetcher.FetchAsync(CancellationToken.None);
 
         Assert.Equal(ClaudeAuthStatus.NoCredentials, outcome.Status);
         Assert.Null(outcome.Result);
         Assert.Equal("pro", outcome.SubscriptionType);
-        Assert.Equal(0, refresher.CallCount);
         Assert.Equal(0, handler.CallCount);
+        Assert.Equal(0, endpoint.CallCount);
     }
 
     [Fact]
-    public async Task FetchAsync_ExpiredAccessToken_RefreshesReloadsAndFetches()
+    public async Task FetchAsync_ValidToken_DoesNotRefresh()
     {
-        var oldCredentials = Credentials("expired-access", "valid-refresh", Now.AddMinutes(-1));
-        var newCredentials = Credentials("new-access", "rotated-refresh", Now.AddHours(8));
-        var store = new FakeCredentialStore(oldCredentials);
-        var refresher = new FakeRefresher(store, newCredentials);
+        var store = new FakeCredentialStore(Credentials("live", "refresh", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint();
         var handler = SuccessHandler();
-        using var fetcher = CreateFetcher(store, refresher, handler);
+        using var fetcher = CreateFetcher(store, handler, endpoint);
 
         var outcome = await fetcher.FetchAsync(CancellationToken.None);
 
         Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
-        Assert.Equal(1, refresher.CallCount);
+        Assert.Equal(12.5, outcome.Result!.FiveHourUsedPercent);
+        Assert.Equal(0, endpoint.CallCount);
+    }
+
+    [Fact]
+    public async Task FetchAsync_ExpiredToken_RefreshesUnderLockSavesAndFetches()
+    {
+        var store = new FakeCredentialStore(Credentials("expired-access", "old-refresh", Now.AddMinutes(-1)));
+        var refreshLock = new FakeRefreshLock();
+        var endpoint = new FakeTokenEndpoint(Tokens("new-access", "new-refresh"));
+        var handler = SuccessHandler();
+        using var fetcher = CreateFetcher(store, handler, endpoint, refreshLock);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
+        Assert.Equal(1, endpoint.CallCount);
+        Assert.Equal(1, refreshLock.AcquireCount);
+        Assert.True(endpoint.LockHeldDuringCall);
+        Assert.Equal("new-refresh", store.Current!.RefreshToken);
         Assert.Equal(["new-access"], handler.BearerTokens);
     }
 
     [Fact]
-    public async Task FetchAsync_RefreshesFiveMinutesBeforeExpiry()
+    public async Task FetchAsync_RefreshesWithinFiveMinutesOfExpiry()
     {
         var store = new FakeCredentialStore(Credentials("nearly-expired", "refresh", Now.AddMinutes(4)));
-        var refresher = new FakeRefresher(store, Credentials("fresh", "rotated", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint(Tokens("fresh", "rotated"));
         var handler = SuccessHandler();
-        using var fetcher = CreateFetcher(store, refresher, handler);
+        using var fetcher = CreateFetcher(store, handler, endpoint);
 
         var outcome = await fetcher.FetchAsync(CancellationToken.None);
 
         Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
-        Assert.Equal(1, refresher.CallCount);
+        Assert.Equal(1, endpoint.CallCount);
         Assert.Equal(["fresh"], handler.BearerTokens);
     }
 
     [Fact]
-    public async Task FetchAsync_ServerRejectsUnexpiredToken_RefreshesAndRetriesOnce()
+    public async Task FetchAsync_ClaudeCodeRotatedBeforeLock_AdoptsPairWithoutExchanging()
     {
-        var store = new FakeCredentialStore(Credentials("server-rejected", "refresh", Now.AddHours(8)));
-        var refresher = new FakeRefresher(store, Credentials("replacement", "rotated", Now.AddHours(8)));
-        var handler = new ScriptedHandler(request =>
-            Bearer(request) == "server-rejected"
-                ? new HttpResponseMessage(HttpStatusCode.Unauthorized)
-                : JsonResponse(HttpStatusCode.OK, UsageJson));
-        using var fetcher = CreateFetcher(store, refresher, handler);
+        var store = new FakeCredentialStore(Credentials("expired-access", "old-refresh", Now.AddMinutes(-1)));
+        var refreshLock = new FakeRefreshLock
+        {
+            // Claude Code finishes its own refresh just before releasing the lock to us.
+            OnAcquire = () => store.Current = Credentials("claude-code-access", "claude-code-refresh", Now.AddHours(8))
+        };
+        var endpoint = new FakeTokenEndpoint(Tokens("unused", "unused"));
+        var handler = SuccessHandler();
+        using var fetcher = CreateFetcher(store, handler, endpoint, refreshLock);
 
         var outcome = await fetcher.FetchAsync(CancellationToken.None);
 
         Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
-        Assert.Equal(1, refresher.CallCount);
-        Assert.Equal(["server-rejected", "replacement"], handler.BearerTokens);
+        Assert.Equal(0, endpoint.CallCount);
+        Assert.Equal(["claude-code-access"], handler.BearerTokens);
     }
 
     [Fact]
-    public async Task FetchAsync_ReplacementIsAlsoRejected_DoesNotLoop()
+    public async Task FetchAsync_LockBusy_DoesNotExchangeAndReportsTransient()
     {
-        var store = new FakeCredentialStore(Credentials("bad-one", "refresh", Now.AddHours(8)));
-        var refresher = new FakeRefresher(store, Credentials("bad-two", "rotated", Now.AddHours(8)));
+        var store = new FakeCredentialStore(Credentials("expired-access", "refresh", Now.AddMinutes(-1)));
+        var refreshLock = new FakeRefreshLock { Busy = true };
+        var endpoint = new FakeTokenEndpoint(Tokens("unused", "unused"));
+        var handler = new ScriptedHandler(_ => throw new InvalidOperationException("HTTP must not be called"));
+        using var fetcher = CreateFetcher(store, handler, endpoint, refreshLock);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Unavailable, outcome.Status);
+        Assert.False(ClaudeIdentity.IsSignInRequired(outcome.Status));
+        Assert.Equal(0, endpoint.CallCount);
+    }
+
+    [Fact]
+    public async Task FetchAsync_DeadGrant_ReportsExpiredAndNeverRetriesThatToken()
+    {
+        var store = new FakeCredentialStore(Credentials("expired-access", "dead-refresh", Now.AddMinutes(-1)));
+        var endpoint = new FakeTokenEndpoint(new ClaudeTokenRefreshResult(ClaudeTokenRefreshOutcome.DeadGrant));
+        var handler = new ScriptedHandler(_ => throw new InvalidOperationException("HTTP must not be called"));
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var first = await fetcher.FetchAsync(CancellationToken.None);
+        var second = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Expired, first.Status);
+        Assert.Equal(ClaudeAuthStatus.Expired, second.Status);
+        Assert.Equal(1, endpoint.CallCount);
+    }
+
+    [Fact]
+    public async Task FetchAsync_NewLoginAfterDeadGrant_IsUsed()
+    {
+        var store = new FakeCredentialStore(Credentials("expired-access", "dead-refresh", Now.AddMinutes(-1)));
+        var endpoint = new FakeTokenEndpoint(new ClaudeTokenRefreshResult(ClaudeTokenRefreshOutcome.DeadGrant));
+        var handler = SuccessHandler();
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        await fetcher.FetchAsync(CancellationToken.None);
+        store.Current = Credentials("after-login", "new-refresh", Now.AddHours(8));
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
+        Assert.Equal(["after-login"], handler.BearerTokens);
+    }
+
+    [Fact]
+    public async Task FetchAsync_TransientRefreshFailure_IsNotASignInProblem()
+    {
+        var store = new FakeCredentialStore(Credentials("expired-access", "refresh", Now.AddMinutes(-1)));
+        var endpoint = new FakeTokenEndpoint(new ClaudeTokenRefreshResult(ClaudeTokenRefreshOutcome.Transient));
+        var handler = new ScriptedHandler(_ => throw new InvalidOperationException("HTTP must not be called"));
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Unavailable, outcome.Status);
+        Assert.Equal("refresh", store.Current!.RefreshToken);
+    }
+
+    [Fact]
+    public async Task FetchAsync_SaveRejectedByCompareAndSwap_AdoptsPairOnDisk()
+    {
+        var store = new FakeCredentialStore(Credentials("expired-access", "old-refresh", Now.AddMinutes(-1)))
+        {
+            // Another writer replaced the file between the exchange and our save.
+            OnSave = s => s.Current = Credentials("other-writer", "other-refresh", Now.AddHours(8))
+        };
+        var endpoint = new FakeTokenEndpoint(Tokens("ours", "ours-refresh"));
+        var handler = SuccessHandler();
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
+        Assert.Equal("other-refresh", store.Current!.RefreshToken);
+        Assert.Equal(["other-writer"], handler.BearerTokens);
+    }
+
+    [Fact]
+    public async Task FetchAsync_TokenRotatedDuringRequest_RereadsFileAndRetriesOnce()
+    {
+        var store = new FakeCredentialStore(Credentials("superseded", "refresh", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint();
+        var handler = new ScriptedHandler(request =>
+        {
+            if (Bearer(request) != "superseded")
+            {
+                return JsonResponse(HttpStatusCode.OK, UsageJson);
+            }
+
+            store.Current = Credentials("replacement", "rotated", Now.AddHours(8));
+            return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+        });
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
+        Assert.Equal(["superseded", "replacement"], handler.BearerTokens);
+        Assert.Equal(0, endpoint.CallCount);
+    }
+
+    [Fact]
+    public async Task FetchAsync_RevokedUnexpiredToken_ForcesOneRefreshAndRetries()
+    {
+        var store = new FakeCredentialStore(Credentials("revoked", "refresh", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint(Tokens("replacement", "rotated"));
+        var handler = new ScriptedHandler(request =>
+            Bearer(request) == "revoked"
+                ? new HttpResponseMessage(HttpStatusCode.Unauthorized)
+                : JsonResponse(HttpStatusCode.OK, UsageJson));
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
+        Assert.Equal(1, endpoint.CallCount);
+        Assert.Equal(["revoked", "replacement"], handler.BearerTokens);
+    }
+
+    [Fact]
+    public async Task FetchAsync_RefreshDisabled_ExpiredTokenIsTransientAndNeverExchanged()
+    {
+        var store = new FakeCredentialStore(Credentials("expired-access", "refresh", Now.AddMinutes(-1)));
+        var refreshLock = new FakeRefreshLock();
+        var endpoint = new FakeTokenEndpoint(Tokens("new-access", "new-refresh"));
+        var handler = SuccessHandler();
+        using var fetcher = CreateFetcher(store, handler, endpoint, refreshLock, allowRefresh: false);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Unavailable, outcome.Status);
+        Assert.Equal(0, endpoint.CallCount);
+        Assert.Equal(0, refreshLock.AcquireCount);
+        Assert.Equal(0, handler.CallCount);
+        Assert.Equal("refresh", store.Current!.RefreshToken);
+    }
+
+    [Fact]
+    public async Task FetchAsync_RefreshDisabled_RejectedTokenAdoptsRotationByClaudeCode()
+    {
+        var store = new FakeCredentialStore(Credentials("stale", "refresh", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint(Tokens("never", "never"));
+        var handler = new ScriptedHandler(request =>
+        {
+            if (Bearer(request) == "stale")
+            {
+                store.Current = Credentials("rotated-by-cli", "rotated", Now.AddHours(8));
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+
+            return JsonResponse(HttpStatusCode.OK, UsageJson);
+        });
+        using var fetcher = CreateFetcher(store, handler, endpoint, allowRefresh: false);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status);
+        Assert.Equal(0, endpoint.CallCount);
+        Assert.Equal(["stale", "rotated-by-cli"], handler.BearerTokens);
+    }
+
+    [Fact]
+    public async Task FetchAsync_RefreshDisabled_RejectedUnchangedTokenReportsUnauthorized()
+    {
+        var store = new FakeCredentialStore(Credentials("revoked", "refresh", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint(Tokens("never", "never"));
         var handler = new ScriptedHandler(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
-        using var fetcher = CreateFetcher(store, refresher, handler);
+        using var fetcher = CreateFetcher(store, handler, endpoint, allowRefresh: false);
 
         var outcome = await fetcher.FetchAsync(CancellationToken.None);
 
         Assert.Equal(ClaudeAuthStatus.Unauthorized, outcome.Status);
-        Assert.Equal(1, refresher.CallCount);
-        Assert.Equal(2, handler.CallCount);
-    }
-
-    [Fact]
-    public async Task FetchAsync_ClaudeDoesNotRotateRejectedToken_DoesNotRetrySameBearer()
-    {
-        var unchanged = Credentials("server-rejected", "refresh", Now.AddHours(8));
-        var store = new FakeCredentialStore(unchanged);
-        var refresher = new FakeRefresher(store, unchanged);
-        var handler = new ScriptedHandler(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
-        using var fetcher = CreateFetcher(store, refresher, handler);
-
-        var outcome = await fetcher.FetchAsync(CancellationToken.None);
-
-        Assert.Equal(ClaudeAuthStatus.Unauthorized, outcome.Status);
-        Assert.Equal(1, refresher.CallCount);
+        Assert.Equal(0, endpoint.CallCount);
         Assert.Equal(1, handler.CallCount);
     }
 
     [Fact]
-    public async Task FetchAsync_RefreshTokenLifetimeExpired_DoesNotLaunchClaude()
+    public async Task FetchAsync_RejectedAndRefreshDead_ReportsUnauthorized()
+    {
+        var store = new FakeCredentialStore(Credentials("revoked", "dead", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint(new ClaudeTokenRefreshResult(ClaudeTokenRefreshOutcome.DeadGrant));
+        var handler = new ScriptedHandler(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Unauthorized, outcome.Status);
+        Assert.Equal(1, handler.CallCount);
+    }
+
+    [Fact]
+    public async Task FetchAsync_RefreshTokenLifetimeExpired_ReportsExpiredWithoutExchange()
     {
         var credentials = Credentials("expired-access", "expired-refresh", Now.AddMinutes(-1)) with
         {
             RefreshTokenExpiresAt = Now.AddSeconds(-1).ToUnixTimeMilliseconds()
         };
         var store = new FakeCredentialStore(credentials);
-        var refresher = new FakeRefresher(store, Credentials("unused", "unused", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint(Tokens("unused", "unused"));
         var handler = new ScriptedHandler(_ => throw new InvalidOperationException("HTTP must not be called"));
-        using var fetcher = CreateFetcher(store, refresher, handler);
+        using var fetcher = CreateFetcher(store, handler, endpoint);
 
         var outcome = await fetcher.FetchAsync(CancellationToken.None);
 
         Assert.Equal(ClaudeAuthStatus.Expired, outcome.Status);
-        Assert.Equal(0, refresher.CallCount);
-        Assert.Equal(0, handler.CallCount);
+        Assert.Equal(0, endpoint.CallCount);
     }
 
     [Fact]
-    public async Task FetchAsync_ForbiddenIsNotMisdiagnosedAsExpiredAuth()
-    {
-        var store = new FakeCredentialStore(Credentials("valid", "refresh", Now.AddHours(8)));
-        var refresher = new FakeRefresher(store, Credentials("unused", "unused", Now.AddHours(8)));
-        var handler = new ScriptedHandler(_ => new HttpResponseMessage(HttpStatusCode.Forbidden));
-        using var fetcher = CreateFetcher(store, refresher, handler);
-
-        var outcome = await fetcher.FetchAsync(CancellationToken.None);
-
-        Assert.Equal(ClaudeAuthStatus.Unavailable, outcome.Status);
-        Assert.Equal(0, refresher.CallCount);
-        Assert.Equal(1, handler.CallCount);
-    }
-
-    [Fact]
-    public async Task FetchAsync_ConcurrentExpiredRequests_CoalesceRefresh()
+    public async Task FetchAsync_ConcurrentFetchers_ExchangeOnce()
     {
         var store = new FakeCredentialStore(Credentials("expired", "refresh", Now.AddMinutes(-1)));
-        var refresher = new FakeRefresher(
-            store,
-            Credentials("fresh", "rotated", Now.AddHours(8)),
-            delay: TimeSpan.FromMilliseconds(100));
+        var endpoint = new FakeTokenEndpoint(Tokens("fresh", "rotated"), delay: TimeSpan.FromMilliseconds(100));
         var handler = SuccessHandler();
-        using var first = CreateFetcher(store, refresher, handler);
-        using var second = CreateFetcher(store, refresher, handler);
+        using var first = CreateFetcher(store, handler, endpoint);
+        using var second = CreateFetcher(store, handler, endpoint);
 
         var outcomes = await Task.WhenAll(
             first.FetchAsync(CancellationToken.None),
             second.FetchAsync(CancellationToken.None));
 
         Assert.All(outcomes, outcome => Assert.Equal(ClaudeAuthStatus.Ok, outcome.Status));
-        Assert.Equal(1, refresher.CallCount);
-        Assert.Equal(2, handler.CallCount);
+        Assert.Equal(1, endpoint.CallCount);
+    }
+
+    [Fact]
+    public async Task FetchAsync_ForbiddenIsNotMisdiagnosedAsExpiredAuth()
+    {
+        var store = new FakeCredentialStore(Credentials("valid", "refresh", Now.AddHours(8)));
+        var endpoint = new FakeTokenEndpoint();
+        var handler = new ScriptedHandler(_ => new HttpResponseMessage(HttpStatusCode.Forbidden));
+        using var fetcher = CreateFetcher(store, handler, endpoint);
+
+        var outcome = await fetcher.FetchAsync(CancellationToken.None);
+
+        Assert.Equal(ClaudeAuthStatus.Unavailable, outcome.Status);
+        Assert.Equal(1, handler.CallCount);
+        Assert.Equal(0, endpoint.CallCount);
     }
 
     private static ClaudeOAuthUsageFetcher CreateFetcher(
         FakeCredentialStore store,
-        FakeRefresher refresher,
-        ScriptedHandler handler)
+        ScriptedHandler handler,
+        FakeTokenEndpoint endpoint,
+        FakeRefreshLock? refreshLock = null,
+        bool allowRefresh = true)
     {
+        refreshLock ??= new FakeRefreshLock();
+        endpoint.Lock = refreshLock;
         var client = new HttpClient(handler) { BaseAddress = new Uri("https://api.anthropic.com") };
-        return new ClaudeOAuthUsageFetcher(client, store, refresher, new FixedTimeProvider(Now));
+        return new ClaudeOAuthUsageFetcher(client, store, refreshLock, endpoint, new FixedTimeProvider(Now), allowRefresh);
     }
 
     private static ScriptedHandler SuccessHandler()
@@ -214,6 +382,16 @@ public sealed class ClaudeOAuthUsageFetcherTests
             ["user:profile", "user:inference"],
             "pro",
             "default_claude_ai");
+
+    private static ClaudeTokenRefreshResult Tokens(string accessToken, string refreshToken)
+        => new(
+            ClaudeTokenRefreshOutcome.Refreshed,
+            new ClaudeRefreshedTokens(
+                accessToken,
+                refreshToken,
+                Now.AddHours(8).ToUnixTimeMilliseconds(),
+                Now.AddDays(30).ToUnixTimeMilliseconds(),
+                null));
 
     private static HttpResponseMessage JsonResponse(HttpStatusCode status, string json)
         => new(status)
@@ -233,10 +411,12 @@ public sealed class ClaudeOAuthUsageFetcherTests
         public FakeCredentialStore(ClaudeCredentials? current)
         {
             _current = current;
-            RefreshLockKey = $"test-{Guid.NewGuid():N}";
+            ConfigDirectory = Path.Combine(Path.GetTempPath(), $"costats-claude-test-{Guid.NewGuid():N}");
         }
 
-        public string RefreshLockKey { get; }
+        public string ConfigDirectory { get; }
+
+        public Action<FakeCredentialStore>? OnSave { get; init; }
 
         public ClaudeCredentials? Current
         {
@@ -249,42 +429,87 @@ public sealed class ClaudeOAuthUsageFetcherTests
             cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(Current);
         }
+
+        public Task<bool> SaveRefreshedAsync(
+            string postedRefreshToken,
+            ClaudeRefreshedTokens tokens,
+            CancellationToken cancellationToken)
+        {
+            OnSave?.Invoke(this);
+            if (Current?.RefreshToken != postedRefreshToken)
+            {
+                return Task.FromResult(false);
+            }
+
+            Current = Current with
+            {
+                AccessToken = tokens.AccessToken,
+                RefreshToken = tokens.RefreshToken,
+                ExpiresAt = tokens.ExpiresAt,
+                RefreshTokenExpiresAt = tokens.RefreshTokenExpiresAt ?? Current.RefreshTokenExpiresAt
+            };
+            return Task.FromResult(true);
+        }
     }
 
-    private sealed class FakeRefresher : IClaudeTokenRefresher
+    private sealed class FakeRefreshLock : IClaudeRefreshLock
     {
-        private readonly FakeCredentialStore _store;
-        private readonly ClaudeCredentials? _refreshed;
+        private int _acquireCount;
+
+        public bool Busy { get; init; }
+        public Action? OnAcquire { get; init; }
+        public bool IsHeld { get; private set; }
+        public int AcquireCount => Volatile.Read(ref _acquireCount);
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string configDirectory, CancellationToken cancellationToken)
+        {
+            if (Busy)
+            {
+                return Task.FromResult<IAsyncDisposable?>(null);
+            }
+
+            Interlocked.Increment(ref _acquireCount);
+            IsHeld = true;
+            OnAcquire?.Invoke();
+            return Task.FromResult<IAsyncDisposable?>(new Release(this));
+        }
+
+        private sealed class Release(FakeRefreshLock owner) : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync()
+            {
+                owner.IsHeld = false;
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+
+    private sealed class FakeTokenEndpoint : IClaudeTokenEndpoint
+    {
+        private readonly ClaudeTokenRefreshResult _result;
         private readonly TimeSpan _delay;
         private int _callCount;
 
-        public FakeRefresher(
-            FakeCredentialStore store,
-            ClaudeCredentials? refreshed,
-            TimeSpan delay = default)
+        public FakeTokenEndpoint(ClaudeTokenRefreshResult? result = null, TimeSpan delay = default)
         {
-            _store = store;
-            _refreshed = refreshed;
+            _result = result ?? new ClaudeTokenRefreshResult(ClaudeTokenRefreshOutcome.Transient);
             _delay = delay;
         }
 
+        public FakeRefreshLock? Lock { get; set; }
+        public bool LockHeldDuringCall { get; private set; }
         public int CallCount => Volatile.Read(ref _callCount);
 
-        public async Task<bool> RefreshAsync(ClaudeCredentials credentials, CancellationToken cancellationToken)
+        public async Task<ClaudeTokenRefreshResult> RefreshAsync(ClaudeCredentials credentials, CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _callCount);
+            LockHeldDuringCall = Lock?.IsHeld == true;
             if (_delay > TimeSpan.Zero)
             {
                 await Task.Delay(_delay, cancellationToken);
             }
 
-            if (_refreshed is null)
-            {
-                return false;
-            }
-
-            _store.Current = _refreshed;
-            return true;
+            return _result;
         }
     }
 

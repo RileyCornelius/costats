@@ -2,6 +2,7 @@ using costats.Application.Pulse;
 using costats.Core.Pulse;
 using costats.Infrastructure.Expense;
 using costats.Infrastructure.Usage;
+using Microsoft.Extensions.Logging;
 
 namespace costats.Infrastructure.Providers;
 
@@ -11,12 +12,14 @@ public sealed class ClaudeLogSource : ISignalSource
     private static readonly TimeSpan WeekDuration = TimeSpan.FromDays(7);
 
     private readonly UsageLogScanner _scanner = new();
-    private readonly ClaudeOAuthUsageFetcher _oauthFetcher = new();
+    private readonly ClaudeOAuthUsageFetcher _oauthFetcher;
+    private readonly ClaudeDesktopUsageReader _desktopReader = new();
     private readonly ExpenseAnalyzer _expenseAnalyzer;
 
-    public ClaudeLogSource(ExpenseAnalyzer expenseAnalyzer)
+    public ClaudeLogSource(ExpenseAnalyzer expenseAnalyzer, ILogger<ClaudeLogSource> logger)
     {
         _expenseAnalyzer = expenseAnalyzer;
+        _oauthFetcher = new ClaudeOAuthUsageFetcher(configDir: null, logger);
     }
 
     public ProviderProfile Profile => ProviderCatalog.Claude;
@@ -32,7 +35,16 @@ public sealed class ClaudeLogSource : ISignalSource
         var logResult = await _scanner.ScanClaudeAsync(cancellationToken).ConfigureAwait(false);
         var consumption = await SafeAnalyzeExpenseAsync(cancellationToken).ConfigureAwait(false);
 
-        var outcome = await oauthTask.ConfigureAwait(false);
+        // The desktop app records usage without needing the terminal CLI's login, so it
+        // covers the common case where only the desktop app is in use.
+        var desktopSample = await _desktopReader.ReadLatestAsync(cancellationToken).ConfigureAwait(false);
+
+        var outcome = ClaudeDesktopUsageReader.Merge(
+            await oauthTask.ConfigureAwait(false),
+            desktopSample,
+            _oauthFetcher.GetLastKnownResult(),
+            logResult.LatestTimestamp,
+            now);
         var oauthResult = outcome.Result;
 
         if (oauthResult is null && logResult.SessionTokens == 0 && logResult.WeekTokens == 0)

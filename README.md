@@ -58,7 +58,7 @@ Setup and troubleshooting details in [docs/CURSOR.md](docs/CURSOR.md).
 
 ## Data sources
 - Codex usage: OAuth usage endpoint via `~/.codex/auth.json` (or `CODEX_HOME`), with local logs as a fallback for estimates.
-- Claude usage: OAuth usage endpoint via CLI-managed `~/.claude/.credentials.json`, with local logs as a fallback for estimates. Costats asks the installed `claude` CLI to refresh near expiry, then reloads the CLI-owned credentials; it never logs, writes, or separately persists Anthropic tokens.
+- Claude usage: OAuth usage endpoint via the Claude Code CLI login in `~/.claude/.credentials.json` (run `claude /login` once), falling back to the Claude desktop app's usage samples in `%APPDATA%\Claude\plan-usage-history.json` and then local logs. By default Costats only reads the CLI's current access token and leaves refreshing to Claude Code, which owns the single-use rotating refresh token. Desktop-only users who never run the CLI can set `COSTATS_CLAUDE_REFRESH=1` to let Costats refresh it near expiry the same way Claude Code does: under Claude Code's own refresh locks (`~/.claude/.oauth_refresh.lock` and `~/.claude.lock`), re-reading the file under the lock, and saving with compare-and-swap. It never logs tokens or stores them anywhere else.
 - Copilot usage: GitHub Copilot usage endpoint via a personal access token stored in Windows Credential Manager, with local Copilot OTEL logs for cost estimates.
 - Cursor usage: cursor.com usage endpoints via the local Cursor session token (auto-detected) or a manually pasted browser cookie.
 - Token + cost estimates: local JSONL logs from `~/.codex/sessions` and `~/.claude/projects`.
